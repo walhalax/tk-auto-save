@@ -1,5 +1,6 @@
 import asyncio
 from typing import Optional, List, Dict, Any # 型ヒント用
+
 import logging
 import os
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
@@ -8,6 +9,7 @@ from fastapi.staticfiles import StaticFiles # 静的ファイル配信用
 from fastapi.templating import Jinja2Templates # HTMLテンプレート用
 from contextlib import asynccontextmanager # lifespan用 (FastAPI 0.90.0+)
 from datetime import datetime, timedelta # 巡回期間制限用
+import re # タスク名からIDを抽出するために追加
 
 # 作成したモジュールをインポート
 from .status_manager import StatusManager
@@ -28,8 +30,8 @@ stop_requested_flag = False # アプリケーションレベルでの停止フ�
 main_task_handle: Optional[asyncio.Task] = None
 
 # 同時実行数制御
-MAX_CONCURRENT_DOWNLOADS = 2
-MAX_CONCURRENT_UPLOADS = 2
+MAX_CONCURRENT_DOWNLOADS = 8 # 5から8に変更
+MAX_CONCURRENT_UPLOADS = 8 # 5から8に変更
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 
@@ -41,12 +43,18 @@ MAX_QUEUE_SIZE = 20
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.info("アプリケーションを起動します...")
+    global stop_requested_flag # グローバル変数にアクセスするために必要
+    stop_requested_flag = False # アプリケーション起動時に停止フラグをリセット
+    await status_manager.clear_stop_request() # StatusManager内の停止フラグもクリア
+
     # アプリケーション起動時のタスクステータスリセットは start エンドポイントに移動
     # await status_manager.reset_state_async()
-    yield
+
+    yield # ここでアプリケーションが起動し、リクエスト処理などが可能になる
+
     logging.info("アプリケーションをシャットダウンします...")
-    global stop_requested_flag, main_task_handle
-    stop_requested_flag = True
+    global main_task_handle # シャットダウン処理で必要
+    stop_requested_flag = True # シャットダウン時に停止フラグを立てる
     if main_task_handle and not main_task_handle.done():
         logging.info("バックグラウンドタスクの完了を待機中...")
         try:
@@ -55,6 +63,12 @@ async def lifespan(app: FastAPI):
             logging.warning("バックグラウンドタスクのシャットダウンがタイムアウトしました。")
         except asyncio.CancelledError:
              logging.info("バックグラウンドタスクはキャンセルされました。")
+
+    # アプリケーションシャットダウン時に状態を保存
+    logging.info("シャットダウン前にタスク状態を保存します。")
+    await status_manager._save_status()
+    logging.info("タスク状態の保存が完了しました。")
+
     logging.info("アプリケーションがシャットダウンしました。")
 
 
@@ -166,12 +180,8 @@ async def upload_worker(fc2_id: str, task_info: dict):
 
             if success:
                 logging.info(f"アップロードワーカー完了 (成功またはスキップ): {fc2_id}")
-                # 成功した場合、ローカルファイルを削除 (オプション)
-                try:
-                    os.remove(local_path)
-                    logging.info(f"ローカルファイルを削除しました: {local_path}")
-                except OSError as e:
-                    logging.warning(f"ローカルファイルの削除に失敗しました: {local_path} - {e}")
+                # アップロード成功後、StatusManagerにローカルファイルの削除を依頼
+                await status_manager.delete_local_file(fc2_id)
             else:
                 # upload_to_server が False を返した場合 (progress_callback でエラーになっていない場合)
                 logging.error(f"アップロードワーカー失敗 (upload_to_server から False): {fc2_id}")
@@ -188,10 +198,16 @@ async def main_background_loop():
     """メインのバックグラウンド処理ループ"""
     global background_tasks_running, stop_requested_flag
     logging.info("メインバックグラウンドループを開始します。")
+    logging.debug(f"main_background_loop 開始時のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
+    logging.debug(f"main_background_loop 開始時のbackground_tasks_running: {background_tasks_running}") # デバッグログ追加
     background_tasks_running = True
-    stop_requested_flag = False
+    stop_requested_flag = False # 開始時にフラグをクリア
 
     try:
+        # スタート時にダウンロードディレクトリをチェックし、レジューム可能なタスクを探す
+        # Auto Start 時にリセットではなくレジュームを行うため、reset_state_async() は削除
+        # await status_manager.check_and_resume_downloads("downloads") # start_processing に移動
+
         # 1. スクレイピング実行
         logging.info("スクレイピングを開始します...")
         processed_ids = await status_manager.get_processed_ids()
@@ -237,10 +253,14 @@ async def main_background_loop():
         # 3. ダウンロード/アップロードワーカーの実行ループ
         active_workers: List[asyncio.Task] = []
         logging.info("--- ワーカー実行ループ開始 ---")
+        logging.debug(f"main_background_loop 開始時のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
+        logging.debug(f"main_background_loop 開始時のbackground_tasks_running: {background_tasks_running}") # デバッグログ追加
         loop_count = 0
         while True:
             loop_count += 1
-            logging.debug(f"--- ワーカー実行ループ {loop_count} 回目 ---")
+            logging.debug(f"--- ワーカー実行ループ {loop_count} 回目開始 ---") # デバッグログ追加
+            logging.debug(f"ループ開始時のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
+
             if stop_requested_flag:
                 logging.info("ワーカー実行ループで停止リクエストを検出。")
                 break
@@ -251,7 +271,7 @@ async def main_background_loop():
             if len(current_download_workers) < MAX_CONCURRENT_DOWNLOADS:
                 async with status_manager._lock: # キューの状態を確認
                     current_queue_ids = status_manager.download_queue.copy()
-                    logging.debug(f"次のDLタスク取得試行前 - キュー内容 ({len(current_queue_ids)}件): {current_queue_ids}")
+                    logging.debug(f"次のDLタスク取得試行前 - キュー内容 ({len(current_queue_ids)}件): {list(current_queue_ids)}") # デバッグログ追加
 
                 next_dl_task_result = await status_manager.get_next_download_task()
 
@@ -282,7 +302,7 @@ async def main_background_loop():
             if len(current_upload_workers) < MAX_CONCURRENT_UPLOADS:
                 async with status_manager._lock: # キューの状態を確認
                     current_ul_queue_ids = status_manager.upload_queue.copy()
-                    logging.debug(f"次のULタスク取得試行前 - キュー内容 ({len(current_ul_queue_ids)}件): {current_ul_queue_ids}")
+                    logging.debug(f"次のULタスク取得試行前 - キュー内容 ({len(current_ul_queue_ids)}件): {list(current_ul_queue_ids)}") # デバッグログ追加
 
                 next_ul_task_result = await status_manager.get_next_upload_task()
                 if next_ul_task_result:
@@ -325,31 +345,66 @@ async def main_background_loop():
 
             # --- 終了条件のチェック ---
             current_status = await status_manager.get_all_status()
-            logging.debug(f"現在のキュー状況: DL={current_status['download_queue_count']}, UL={current_status['upload_queue_count']}")
+            logging.debug(f"現在のキュー状況 (終了チェック前): DL={current_status['download_queue_count']}, UL={current_status['upload_queue_count']}") # デバッグログ追加
+            logging.debug(f"アクティブなワーカー数 (終了チェック前): {len(active_workers)}") # デバッグログ維持
+            logging.debug(f"停止リクエストフラグ (終了チェック前): {stop_requested_flag}") # デバッグログ維持
+
             if current_status['download_queue_count'] == 0 and \
                current_status['upload_queue_count'] == 0 and \
                not active_workers:
                 logging.info("すべてのキューが空になり、アクティブなワーカーもありません。ループを終了します。")
                 break
+            
+            # Stopリクエストがあった場合、キューが空でなくてもループを終了
+            if stop_requested_flag:
+                 logging.info("停止リクエストが検出されたため、ワーカー実行ループを終了します。")
+                 break
+
 
             logging.debug("ループ待機 (1秒)...")
             await asyncio.sleep(1)
 
     except asyncio.CancelledError:
         logging.info("メインバックグラウンドループがキャンセルされました。")
-        for task in active_workers:
-            if not task.done():
-                task.cancel()
-        if active_workers:
-             await asyncio.gather(*[t for t in active_workers if not t.done()], return_exceptions=True)
-             logging.info("実行中のワーカーをキャンセルしました。")
+        # 実行中のワーカーをキャンセルし、状態をpausedに更新
+        tasks_to_cancel = [t for t in active_workers if not t.done()] # キャンセル対象のタスクリスト
+        logging.info(f"{len(tasks_to_cancel)} 件の実行中タスクを中断します。")
+        
+        paused_tasks_ids = [] # pausedに更新するタスクのIDリスト
+        for task in tasks_to_cancel:
+            task.cancel()
+            # タスク名からFC2 IDを抽出してpaused_tasks_idsに追加
+            task_name = task.get_name()
+            match = re.match(r"(download|upload)-(FC2-PPV-\d+)", task_name)
+            if match:
+                task_type = match.group(1)
+                fc2_id = match.group(2)
+                paused_tasks_ids.append((fc2_id, task_type)) # (ID, タイプ) のタプルで保存
+            else:
+                logging.warning(f"タスク名 '{task_name}' からFC2 IDを抽出できませんでした。状態を更新できません。")
+
+        # キャンセルされたタスクが実際に終了するまで待機
+        if tasks_to_cancel:
+             logging.info("実行中のワーカーの終了を待機中...")
+             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+             logging.info("実行中のワーカーの終了待機が完了しました。")
+
+        # 終了待機後に、paused_tasks_idsリストを使って状態を更新
+        for fc2_id, task_type in paused_tasks_ids:
+             logging.info(f"タスク {fc2_id} ({task_type}) をpaused状態に更新します。")
+             # StatusManagerを使って状態を更新
+             if task_type == "download":
+                 await status_manager.update_download_progress(fc2_id, {"status": "paused", "message": "中断されました"})
+             elif task_type == "upload":
+                 await status_manager.update_upload_progress(fc2_id, {"status": "paused", "message": "中断されました"})
+
 
     except Exception as e:
         logging.error(f"メインバックグラウンドループで予期せぬエラーが発生しました: {e}", exc_info=True)
     finally:
         logging.info("メインバックグラウンドループが終了しました。")
         background_tasks_running = False
-        stop_requested_flag = False
+        stop_requested_flag = False # 終了時にフラグをクリア
 
 
 # --- API エンドポイント ---
@@ -375,26 +430,51 @@ async def get_status():
 @app.post("/start")
 async def start_processing(background_tasks: BackgroundTasks):
     """バックグラウンド処理を開始する"""
-    global background_tasks_running, main_task_handle
+    global background_tasks_running, stop_requested_flag, main_task_handle # stop_requested_flag を追加
+
+    # Auto Start が押されたら、まず停止フラグを強制的に解除
+    logging.info("Auto Start リクエスト: 停止フラグを強制解除します。") # ログ追加
+    stop_requested_flag = False
+    await status_manager.clear_stop_request()
+    logging.debug(f"停止フラグ解除後のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
+
+
     if background_tasks_running:
         raise HTTPException(status_code=400, detail="処理は既に実行中です。")
 
     logging.info("バックグラウンド処理の開始リクエストを受け付けました。")
-    # ここでタスクステータスをリセット
-    await status_manager.reset_state_async()
+    logging.debug(f"start_processing 実行時のstop_requested_flag: {stop_requested_flag}") # デバッグログ維持
+    logging.debug(f"start_processing 実行時のbackground_tasks_running: {background_tasks_running}") # デバッグログ維持
+
+    # Auto Start 時にリセットではなくレジュームを行うため、reset_state_async() は削除
+    # await status_manager.reset_state_async() # 削除済み
+
+    # ダウンロードディレクトリをチェックし、既存ファイルに基づいてタスク状態を更新
+    await status_manager.check_and_resume_downloads("downloads") # ここに移動
+
+    # 中断されたタスクをレジュームキューに戻す
+    await status_manager.resume_paused_tasks()
+
     main_task_handle = asyncio.create_task(main_background_loop(), name="main_loop")
     return JSONResponse(content={"message": "バックグラウンド処理を開始しました。"})
 
 @app.post("/stop")
 async def stop_processing():
     """バックグラウンド処理の中断をリクエストする"""
-    global stop_requested_flag
+    global stop_requested_flag, main_task_handle # main_task_handle を追加
     if not background_tasks_running:
         raise HTTPException(status_code=400, detail="処理は実行されていません。")
 
     logging.info("バックグラウンド処理の停止リクエストを受け付けました。")
     stop_requested_flag = True
     await status_manager.request_stop()
+
+    # メインバックグラウンドタスクをキャンセル
+    if main_task_handle and not main_task_handle.done():
+        logging.info("メインバックグラウンドタスクのキャンセルを試みます。")
+        main_task_handle.cancel()
+        # キャンセルが完了するまで待つ必要はない（シャットダウン時に待機するため）
+
     return JSONResponse(content={"message": "処理の中断をリクエストしました。完了まで時間がかかる場合があります。"})
 
 

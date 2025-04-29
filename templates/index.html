@@ -14,11 +14,12 @@
         th { background-color: #f2f2f2; }
         .progress-bar-container { width: 100%; background-color: #e0e0e0; border-radius: 4px; overflow: hidden; }
         .progress-bar { height: 18px; background-color: #4CAF50; width: 0%; text-align: center; color: white; line-height: 18px; font-size: 12px; transition: width 0.3s ease; }
-        .status-pending_download, .status-pending_upload { color: #888; }
-        .status-downloading, .status-uploading { color: #007bff; }
-        .status-completed, .status-skipped { color: #28a745; }
-        .status-failed_download, .status-failed_upload { color: #dc3545; font-weight: bold; }
-        .status-paused { color: #ffc107; }
+        .status-text { font-weight: bold; margin-bottom: 4px; } /* ステータステキスト用のスタイル */
+        .status-pending_download .status-text, .status-pending_upload .status-text { color: #888; }
+        .status-downloading .status-text, .status-uploading .status-text { color: #007bff; }
+        .status-completed .status-text, .status-skipped .status-text { color: #28a745; }
+        .status-failed_download .status-text, .status-failed_upload .status-text { color: #dc3545; }
+        .status-paused .status-text { color: #ffc107; }
         #error-message { color: red; margin-top: 10px; }
     </style>
 </head>
@@ -29,7 +30,7 @@
         <div class="controls">
             <button id="startButton">Auto Start</button>
             <button id="stopButton" disabled>Stop</button>
-            <button id="resumeButton" disabled>Resume</button>
+            
             <button id="resetFailedButton">Reset Failed Tasks</button>
         </div>
 
@@ -49,8 +50,7 @@
                     <tr>
                         <th>FC2 ID</th>
                         <th>Title</th>
-                        <th>Status</th>
-                        <th>Progress</th>
+                        <th>Status / Progress</th> <!-- ヘッダーを変更 -->
                         <th>Error</th>
                     </tr>
                 </thead>
@@ -69,7 +69,7 @@
         const taskTableBody = document.querySelector('#taskTable tbody');
         const startButton = document.getElementById('startButton');
         const stopButton = document.getElementById('stopButton');
-        const resumeButton = document.getElementById('resumeButton');
+        // const resumeButton = document.getElementById('resumeButton'); // 削除
         const resetFailedButton = document.getElementById('resetFailedButton');
         const errorMessageEl = document.getElementById('errorMessage');
 
@@ -122,8 +122,8 @@
             stopButton.disabled = !data.background_running || data.stop_requested;
             // Resume is enabled only if not running AND there are paused tasks (or potentially failed tasks to retry)
             // A more precise check would involve looking at task_status for 'paused' state
-            const hasPausedTasks = Object.values(data.task_status).some(task => task.status === 'paused');
-            resumeButton.disabled = data.background_running || data.stop_requested; // Simplified: enable if stopped
+            // const hasPausedTasks = Object.values(data.task_status).some(task => task.status === 'paused'); // 削除
+            // resumeButton.disabled = data.background_running || data.stop_requested; // 削除
 
             // Update task table
             taskTableBody.innerHTML = ''; // Clear existing rows
@@ -142,7 +142,7 @@
             if (tasksToDisplay.length === 0) {
                  const row = taskTableBody.insertRow();
                  const cell = row.insertCell();
-                 cell.colSpan = 5;
+                 cell.colSpan = 4; // 列数を変更
                  cell.textContent = 'No tasks to display.';
                  cell.style.textAlign = 'center';
 
@@ -154,20 +154,23 @@
                     row.insertCell().textContent = taskId;
                     row.insertCell().textContent = task.title || 'N/A';
 
-                    const statusCell = row.insertCell();
-                    statusCell.textContent = task.status || 'N/A';
-                    statusCell.className = `status-${task.status}`; // Apply CSS class
+                    // StatusとProgressを同じセルに表示
+                    const statusProgressCell = row.insertCell();
+                    statusProgressCell.className = `status-${task.status}`; // ステータスに応じたクラスをセルに適用
 
-                    const progressCell = row.insertCell();
-                    if (task.status === 'downloading' || task.status === 'uploading' || task.status === 'completed' || task.status === 'skipped') {
+                    const statusText = task.status || 'N/A';
+                    statusProgressCell.innerHTML = `<div class="status-text">${statusText}</div>`; // ステータステキスト
+
+                    // Progressバーとパーセンテージ表示
+                    if (task.hasOwnProperty('progress')) {
                         const progress = task.progress || 0;
-                        progressCell.innerHTML = `
+                         // Ensure progress is a number and within 0-100
+                        const clampedProgress = Math.max(0, Math.min(100, parseFloat(progress) || 0));
+                        statusProgressCell.innerHTML += `
                             <div class="progress-bar-container">
-                                <div class="progress-bar" style="width: ${progress}%;">${progress.toFixed(1)}%</div>
+                                <div class="progress-bar" style="width: ${clampedProgress}%;">${clampedProgress.toFixed(1)}%</div>
                             </div>
                         `;
-                    } else {
-                        progressCell.textContent = '-';
                     }
 
 
@@ -182,7 +185,7 @@
         // --- Event Listeners ---
         startButton.addEventListener('click', () => postControlAction('/start'));
         stopButton.addEventListener('click', () => postControlAction('/stop'));
-        resumeButton.addEventListener('click', () => postControlAction('/resume'));
+        // resumeButton.addEventListener('click', () => postControlAction('/resume')); // 削除
         resetFailedButton.addEventListener('click', () => postControlAction('/reset_failed'));
 
         // --- Initialization ---
@@ -196,7 +199,7 @@
         function startPolling() {
             clearIntervalIfRunning(); // Clear any existing interval
             fetchStatus(); // Fetch immediately
-            intervalId = setInterval(fetchStatus, 3000); // Poll every 3 seconds
+            intervalId = setInterval(fetchStatus, 1000); // Poll every 1 second (changed from 3000)
         }
 
         // Start polling when the page loads

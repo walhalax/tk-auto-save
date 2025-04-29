@@ -17,6 +17,7 @@ import re
 from typing import Callable, Dict, Any, Optional
 from io import BytesIO # ファイルアップロード用
 from dotenv import load_dotenv # .env ファイル読み込み用
+import time # 進捗報告のタイミング制御用
 
 # ロギング設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -156,13 +157,71 @@ def _upload_file_smb(local_path: str, remote_path_pysmb: str, progress_callback:
 
         logging.info(f"SMBアップロード開始: {local_path} -> {FILEHUB_SHARE}{full_remote_path}")
 
+        local_file_size = os.path.getsize(local_path)
+        uploaded_size = 0
+        chunk_size = 8192 # 8KB チャンク
+        last_report_time = time.time()
+        report_interval = 0.5 # 0.5秒ごとに進捗報告
+
         if progress_callback:
-            # pysmb には直接的な進捗コールバックがないため、開始時のみ通知
-            progress_callback({"status": "uploading", "percentage": 0, "message": "アップロード開始"})
+            progress_callback({"status": "uploading", "percentage": 0, "message": "アップロード開始", "uploaded_bytes": 0, "total_bytes": local_file_size})
 
         with open(local_path, 'rb') as local_file:
-            # storeFile はファイルオブジェクトを受け付ける
-            conn.storeFile(FILEHUB_SHARE, full_remote_path, local_file)
+            # storeFile はファイルオブジェクトを受け付けるが、進捗を得るためにはチャンクで読み込む
+            # pysmb の storeFile はファイルオブジェクト全体を渡すため、進捗コールバックを内部でサポートしていない
+            # 進捗報告のためには、手動でチャンクを読み込み、SMBConnection.storeFileFromOffset を使う必要がある
+            # または、storeFile を使いつつ、別のスレッド/プロセスでファイルサイズの変化を監視する (複雑)
+
+            # ここでは、storeFile を使いつつ、開始時と終了時、および定期的な概算報告を行う
+            # より正確なリアルタイム進捗には pysmb の低レベルAPI または別のライブラリが必要
+            # 一旦、開始時、終了時、そして定期的な時間ベースの報告を実装
+
+            # storeFile を呼び出す前に、ファイルサイズを取得
+            # storeFile はファイル全体を一度に読み込むため、進捗コールバックは開始直後と完了直前にしか呼ばれない
+            # リアルタイム性を出すには、ファイルをチャンクに分けて読み込み、SMBConnection.storeFileFromOffset を使う必要がある
+            # storeFileFromOffset はファイルオブジェクトとオフセット、サイズを受け取る
+            # 例: conn.storeFileFromOffset(service_name, path, file_obj, offset, max_length)
+
+            # storeFileFromOffset を使うように修正
+            offset = 0
+            while offset < local_file_size:
+                # チャンクを読み込む
+                local_file.seek(offset)
+                chunk = local_file.read(chunk_size)
+                if not chunk:
+                    break # ファイルの終端に達した
+
+                # SMBに書き込む
+                # storeFileFromOffset は BytesIO のような seek/read を持つオブジェクトを期待する
+                chunk_io = BytesIO(chunk)
+                conn.storeFileFromOffset(FILEHUB_SHARE, full_remote_path, chunk_io, offset, len(chunk))
+
+                uploaded_size += len(chunk)
+                offset += len(chunk)
+
+                current_time = time.time()
+                # 定期的に進捗報告
+                if progress_callback and (current_time - last_report_time > report_interval):
+                    percentage = (uploaded_size / local_file_size * 100) if local_file_size > 0 else 0
+                    progress_callback({
+                        "status": "uploading",
+                        "percentage": round(percentage, 2),
+                        "uploaded_bytes": uploaded_size,
+                        "total_bytes": local_file_size,
+                        "message": f"アップロード中 ({percentage:.2f}%)"
+                    })
+                    last_report_time = current_time
+
+            # ループ終了後、最後の進捗報告 (100%)
+            if progress_callback:
+                 progress_callback({
+                     "status": "uploading", # 完了直前も uploading ステータスで100%を報告
+                     "percentage": 100.0,
+                     "uploaded_bytes": local_file_size,
+                     "total_bytes": local_file_size,
+                     "message": "アップロード完了間近"
+                 })
+
 
         logging.info(f"SMBアップロード完了: {FILEHUB_SHARE}{full_remote_path}")
         if progress_callback:
@@ -236,6 +295,7 @@ async def upload_to_server(
                 return True # スキップも成功扱い
 
         # 6. ファイルアップロード (非同期実行)
+        # _upload_file_smb は同期関数なので asyncio.to_thread でラップ
         await asyncio.to_thread(_upload_file_smb, local_file_path, remote_file_path_pysmb, progress_callback)
 
         return True # アップロード成功
