@@ -3,120 +3,205 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>動画ダウンロードアプリ</title>
+    <title>tk-auto-dl Controller</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f0f0f0;
-        }
-        .container {
-            background-color: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-        }
-        .status-box {
-            border: 1px solid #ddd;
-            padding: 15px;
-            margin: 10px 0;
-            border-radius: 4px;
-        }
-        .progress-bar {
-            width: 100%;
-            height: 20px;
-            background-color: #eee;
-            border-radius: 10px;
-            overflow: hidden;
-            margin: 10px 0;
-        }
-        .progress {
-            width: 0%;
-            height: 100%;
-            background-color: #4CAF50;
-            transition: width 0.3s ease-in-out;
-        }
-        button {
-            background-color: #4CAF50;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            margin: 5px;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-        .controls {
-            margin: 20px 0;
-        }
+        body { font-family: sans-serif; line-height: 1.6; padding: 20px; }
+        .container { max-width: 960px; margin: auto; }
+        .controls button { padding: 10px 15px; margin-right: 10px; cursor: pointer; }
+        .status-section, .tasks-section { margin-top: 20px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .progress-bar-container { width: 100%; background-color: #e0e0e0; border-radius: 4px; overflow: hidden; }
+        .progress-bar { height: 18px; background-color: #4CAF50; width: 0%; text-align: center; color: white; line-height: 18px; font-size: 12px; transition: width 0.3s ease; }
+        .status-pending_download, .status-pending_upload { color: #888; }
+        .status-downloading, .status-uploading { color: #007bff; }
+        .status-completed, .status-skipped { color: #28a745; }
+        .status-failed_download, .status-failed_upload { color: #dc3545; font-weight: bold; }
+        .status-paused { color: #ffc107; }
+        #error-message { color: red; margin-top: 10px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>動画ダウンロードアプリ</h1>
-        
+        <h1>tk-auto-dl Controller</h1>
+
         <div class="controls">
-            <button onclick="startDownload()">Auto Start</button>
-            <button onclick="stopDownload()">中断</button>
-            <button onclick="resumeDownload()">再開</button>
+            <button id="startButton">Auto Start</button>
+            <button id="stopButton" disabled>Stop</button>
+            <button id="resumeButton" disabled>Resume</button>
+            <button id="resetFailedButton">Reset Failed Tasks</button>
         </div>
 
-        <div id="statusBox" class="status-box">
-            <h3>状態: <span id="status">待機中</span></h3>
-            <div class="progress-bar">
-                <div class="progress" id="progressBar"></div>
-            </div>
-            <p>現在のファイル: <span id="currentFile"></span></p>
-            <p>進捗: <span id="progressPercent">0%</span></p>
-            <p>完了数: <span id="completedFiles">0</span> / <span id="totalFiles">0</span></p>
+        <div class="status-section">
+            <h2>Overall Status</h2>
+            <p><strong>Background Process:</strong> <span id="bgStatus">Idle</span></p>
+            <p><strong>Download Queue:</strong> <span id="dlQueueCount">0</span></p>
+            <p><strong>Upload Queue:</strong> <span id="ulQueueCount">0</span></p>
+            <p><strong>Processed (Completed/Skipped):</strong> <span id="processedCount">0</span></p>
+            <p id="errorMessage" style="color: red;"></p>
+        </div>
+
+        <div class="tasks-section">
+            <h2>Task Status</h2>
+            <table id="taskTable">
+                <thead>
+                    <tr>
+                        <th>FC2 ID</th>
+                        <th>Title</th>
+                        <th>Status</th>
+                        <th>Progress</th>
+                        <th>Error</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <!-- Task rows will be inserted here by JavaScript -->
+                </tbody>
+            </table>
         </div>
     </div>
 
     <script>
-        function updateStatus() {
-            fetch('/status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('status').textContent = data.status;
-                    document.getElementById('progressPercent').textContent = `${data.progress}%`;
-                    document.getElementById('progressBar').style.width = `${data.progress}%`;
-                    document.getElementById('currentFile').textContent = data.current_file;
-                    document.getElementById('completedFiles').textContent = data.completed_files;
-                    document.getElementById('totalFiles').textContent = data.total_files;
+        const bgStatusEl = document.getElementById('bgStatus');
+        const dlQueueCountEl = document.getElementById('dlQueueCount');
+        const ulQueueCountEl = document.getElementById('ulQueueCount');
+        const processedCountEl = document.getElementById('processedCount');
+        const taskTableBody = document.querySelector('#taskTable tbody');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const resumeButton = document.getElementById('resumeButton');
+        const resetFailedButton = document.getElementById('resetFailedButton');
+        const errorMessageEl = document.getElementById('errorMessage');
+
+        let intervalId = null;
+
+        // --- API Call Functions ---
+        async function fetchStatus() {
+            try {
+                const response = await fetch('/status');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+                updateUI(data);
+            } catch (error) {
+                console.error('Error fetching status:', error);
+                errorMessageEl.textContent = `Error fetching status: ${error.message}. Retrying...`;
+                // Stop interval on error? Or let it retry?
+                // clearIntervalIfRunning();
+            }
+        }
+
+        async function postControlAction(endpoint) {
+             errorMessageEl.textContent = ''; // Clear previous errors
+            try {
+                const response = await fetch(endpoint, { method: 'POST' });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.detail || `HTTP error! status: ${response.status}`);
+                }
+                console.log(`${endpoint} action successful:`, data.message);
+                // Immediately fetch status to reflect changes
+                fetchStatus();
+            } catch (error) {
+                console.error(`Error calling ${endpoint}:`, error);
+                errorMessageEl.textContent = `Error: ${error.message}`;
+            }
+        }
+
+        // --- UI Update Function ---
+        function updateUI(data) {
+            // Update overall status
+            bgStatusEl.textContent = data.background_running ? (data.stop_requested ? 'Stopping...' : 'Running') : 'Idle';
+            dlQueueCountEl.textContent = data.download_queue_count;
+            ulQueueCountEl.textContent = data.upload_queue_count;
+            processedCountEl.textContent = data.processed_count;
+
+            // Update button states
+            startButton.disabled = data.background_running;
+            stopButton.disabled = !data.background_running || data.stop_requested;
+            // Resume is enabled only if not running AND there are paused tasks (or potentially failed tasks to retry)
+            // A more precise check would involve looking at task_status for 'paused' state
+            const hasPausedTasks = Object.values(data.task_status).some(task => task.status === 'paused');
+            resumeButton.disabled = data.background_running || data.stop_requested; // Simplified: enable if stopped
+
+            // Update task table
+            taskTableBody.innerHTML = ''; // Clear existing rows
+            const sortedTaskIds = Object.keys(data.task_status).sort((a, b) => {
+                 // Sort by added time if available, otherwise by ID
+                 const timeA = data.task_status[a]?.added_time || 0;
+                 const timeB = data.task_status[b]?.added_time || 0;
+                 return timeA - timeB;
+            });
+
+            // Limit displayed tasks (e.g., last 50) to avoid performance issues
+            const displayLimit = 100;
+            const tasksToDisplay = sortedTaskIds.slice(-displayLimit);
+
+
+            if (tasksToDisplay.length === 0) {
+                 const row = taskTableBody.insertRow();
+                 const cell = row.insertCell();
+                 cell.colSpan = 5;
+                 cell.textContent = 'No tasks to display.';
+                 cell.style.textAlign = 'center';
+
+            } else {
+                tasksToDisplay.forEach(taskId => {
+                    const task = data.task_status[taskId];
+                    const row = taskTableBody.insertRow();
+
+                    row.insertCell().textContent = taskId;
+                    row.insertCell().textContent = task.title || 'N/A';
+
+                    const statusCell = row.insertCell();
+                    statusCell.textContent = task.status || 'N/A';
+                    statusCell.className = `status-${task.status}`; // Apply CSS class
+
+                    const progressCell = row.insertCell();
+                    if (task.status === 'downloading' || task.status === 'uploading' || task.status === 'completed' || task.status === 'skipped') {
+                        const progress = task.progress || 0;
+                        progressCell.innerHTML = `
+                            <div class="progress-bar-container">
+                                <div class="progress-bar" style="width: ${progress}%;">${progress.toFixed(1)}%</div>
+                            </div>
+                        `;
+                    } else {
+                        progressCell.textContent = '-';
+                    }
+
+
+                    const errorCell = row.insertCell();
+                    errorCell.textContent = task.error_message || '';
+                    errorCell.style.color = 'red';
+                    errorCell.style.fontSize = '0.9em';
                 });
+            }
         }
 
-        function startDownload() {
-            fetch('/start', {
-                method: 'POST'
-            })
-            .then(response => response.json())
-            .then(data => {
-                updateStatus();
-            });
+        // --- Event Listeners ---
+        startButton.addEventListener('click', () => postControlAction('/start'));
+        stopButton.addEventListener('click', () => postControlAction('/stop'));
+        resumeButton.addEventListener('click', () => postControlAction('/resume'));
+        resetFailedButton.addEventListener('click', () => postControlAction('/reset_failed'));
+
+        // --- Initialization ---
+        function clearIntervalIfRunning() {
+            if (intervalId) {
+                clearInterval(intervalId);
+                intervalId = null;
+            }
         }
 
-        function stopDownload() {
-            fetch('/stop', {
-                method: 'POST'
-            })
-            .then(response => {
-                alert('ダウンロードを中断しました');
-                updateStatus();
-            });
+        function startPolling() {
+            clearIntervalIfRunning(); // Clear any existing interval
+            fetchStatus(); // Fetch immediately
+            intervalId = setInterval(fetchStatus, 3000); // Poll every 3 seconds
         }
 
-        function resumeDownload() {
-            // 再開機能の実装
-            alert('再開機能はまだ実装されていません');
-        }
+        // Start polling when the page loads
+        startPolling();
 
-        // 定期的に状態を更新
-        setInterval(updateStatus, 1000);
     </script>
 </body>
 </html>

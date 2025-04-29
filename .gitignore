@@ -23,6 +23,7 @@ wheels/
 venv/
 ENV/
 env/
+.venv/ # 追加
 
 # IDE
 .vscode/
@@ -48,4 +49,6 @@ temp/
 .Spotlight-V100
 .Trashes
 ehthumbs.db
-Thumbs.db
+
+# Reference files
+reference/ # 追加

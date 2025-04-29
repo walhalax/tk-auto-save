@@ -1,19 +1,8 @@
-# Web Framework & UI
-streamlit==1.33.0 # Streamlitのバージョンを追記 (適宜更新)
-Flask==3.0.2 # web_app.pyでは使われていないが、元々あったので残すか検討
-
-# Video Downloading
-yt-dlp==2024.04.09 # youtube-dlの代わりにyt-dlpを使用
-
-# HTTP Requests (yt-dlpが内部で使用する可能性あり)
-requests==2.31.0
-
-# Data Processing (現状使われていないが、元々あったので残すか検討)
-numpy==1.26.0
-pandas==2.1.4
-
-# Development Tools
-pytest==8.0.2
-
-# Other Dependencies
-python-dotenv==1.0.0
+fastapi
+uvicorn[standard]
+httpx
+beautifulsoup4
+python-dotenv
+pysmb
+Jinja2
+# 必要に応じて他のライブラリを追加 (例: データベース用など)

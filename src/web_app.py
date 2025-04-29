@@ -1,153 +1,428 @@
-import streamlit as st
-from src.download_module import DownloadManager # Uploaderは削除
+import asyncio
+from typing import Optional, List, Dict, Any # 型ヒント用
+import logging
 import os
-import time
-import logging # ロギングを追加
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles # 静的ファイル配信用
+from fastapi.templating import Jinja2Templates # HTMLテンプレート用
+from contextlib import asynccontextmanager # lifespan用 (FastAPI 0.90.0+)
+from datetime import datetime, timedelta # 巡回期間制限用
 
-# ロギング設定 (download_moduleと合わせるか、アプリ固有の設定を行う)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 作成したモジュールをインポート
+from .status_manager import StatusManager
+from .content_scraper import scrape_eligible_videos
+from .download_module import download_video_from_page
+from .upload_module import upload_to_server
 
-# DownloadManagerのインスタンスをセッション状態で管理
-if "download_manager" not in st.session_state:
-    st.session_state.download_manager = DownloadManager()
+# ロギング設定 (DEBUG レベルで詳細を確認)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s')
 
-manager: DownloadManager = st.session_state.download_manager
+# --- グローバル変数 ---
+# StatusManager のインスタンス
+status_manager = StatusManager()
 
-def main():
-    st.title("YouTube Auto Downloader") # タイトル変更
+# バックグラウンドタスク管理用
+background_tasks_running = False
+stop_requested_flag = False # アプリケーションレベルでの停止フラグ
+main_task_handle: Optional[asyncio.Task] = None
 
-    # --- 設定セクション ---
-    with st.expander("設定", expanded=True): # 最初から開いておく
-        # 一時フォルダ設定 (テキスト入力に変更)
-        current_temp_folder = manager._temp_folder # 現在の設定値を取得
-        temp_folder_input = st.text_input("一時フォルダ (絶対パス推奨):", value=current_temp_folder)
-        if st.button("一時フォルダを設定"):
-            try:
-                manager.set_temp_folder(temp_folder_input)
-                st.success(f"一時フォルダが '{temp_folder_input}' に設定されました。")
-                # 画面を再描画して入力フィールドの値を更新
-                st.rerun()
-            except ValueError as e:
-                st.error(f"フォルダ設定エラー: {e}")
-            except Exception as e:
-                st.error(f"予期せぬエラーが発生しました: {e}")
-                logging.error(f"一時フォルダ設定中のエラー: {e}", exc_info=True)
+# 同時実行数制御
+MAX_CONCURRENT_DOWNLOADS = 2
+MAX_CONCURRENT_UPLOADS = 2
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 
-    # --- ダウンロード追加セクション ---
-    st.header("ダウンロード追加")
-    url = st.text_input("YouTube URL:", key="url_input") # keyを設定して入力保持
-    # qualityの選択肢をyt-dlpに合わせて変更
-    quality_options = {"最高画質": "highest", "最低画質": "lowest"}
-    selected_quality_label = st.selectbox("画質:", options=list(quality_options.keys()))
-    selected_quality_value = quality_options[selected_quality_label]
+# 追加要件用定数
+MAX_QUEUE_SIZE = 20
 
-    if st.button("キューに追加"):
-        if url:
-            manager.add_to_queue(url, selected_quality_value)
-            st.success(f"キューに追加されました: {url}")
-            # 入力フィールドをクリアするためにキーを使って値をリセット (st.rerunでも可)
-            st.session_state.url_input = ""
-            st.rerun() # キュー表示を更新
+# --- FastAPI アプリケーション設定 ---
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logging.info("アプリケーションを起動します...")
+    # アプリケーション起動時のタスクステータスリセットは start エンドポイントに移動
+    # await status_manager.reset_state_async()
+    yield
+    logging.info("アプリケーションをシャットダウンします...")
+    global stop_requested_flag, main_task_handle
+    stop_requested_flag = True
+    if main_task_handle and not main_task_handle.done():
+        logging.info("バックグラウンドタスクの完了を待機中...")
+        try:
+            await asyncio.wait_for(main_task_handle, timeout=10.0)
+        except asyncio.TimeoutError:
+            logging.warning("バックグラウンドタスクのシャットダウンがタイムアウトしました。")
+        except asyncio.CancelledError:
+             logging.info("バックグラウンドタスクはキャンセルされました。")
+    logging.info("アプリケーションがシャットダウンしました。")
+
+
+app = FastAPI(lifespan=lifespan)
+
+# --- 静的ファイルとテンプレートの設定 ---
+templates_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
+if not os.path.isdir(templates_dir):
+     logging.warning(f"Templates directory not found at: {templates_dir}. Creating it.")
+     try:
+         os.makedirs(templates_dir)
+     except OSError as e:
+         logging.error(f"Failed to create templates directory: {e}")
+else:
+     templates = Jinja2Templates(directory=templates_dir)
+
+
+# --- バックグラウンドワーカー ---
+
+async def download_worker(fc2_id: str, task_info: dict):
+    """ダウンロードタスクを実行するワーカー"""
+    async with download_semaphore:
+        if stop_requested_flag:
+            logging.info(f"停止リクエスト検出のため、ダウンロードをスキップ: {fc2_id}")
+            return
+
+        logging.info(f"ダウンロードワーカー開始: {fc2_id}")
+        video_page_url = task_info.get("video_page_url")
+        title = task_info.get("title", fc2_id)
+        output_dir = "downloads"
+        os.makedirs(output_dir, exist_ok=True) # downloads ディレクトリがなければ作成
+
+        async def progress_callback(progress_data: Dict[str, Any]):
+            await status_manager.update_download_progress(fc2_id, progress_data)
+
+        success = False
+        local_path = None
+        try:
+            # download_video_from_page は成功時にローカルパスを返すように変更が必要かもしれない
+            # 現状は成功フラグのみと仮定
+            result = await download_video_from_page(
+                video_page_url,
+                output_filename=title,
+                output_directory=output_dir,
+                progress_callback=progress_callback
+            )
+            # download_video_from_page がパスを返す場合
+            if isinstance(result, str) and os.path.exists(result):
+                 success = True
+                 local_path = result
+            # download_video_from_page がブール値を返す場合 (旧仕様)
+            elif isinstance(result, bool) and result:
+                 success = True
+                 # この場合、ファイル名を推測する必要がある
+                 safe_filename = "".join(c if c.isalnum() or c in (' ', '.', '_', '-') else '_' for c in title)
+                 if not safe_filename.lower().endswith('.mp4'):
+                     safe_filename += '.mp4'
+                 local_path = os.path.join(output_dir, safe_filename)
+                 if not os.path.exists(local_path):
+                      logging.error(f"ダウンロード成功と報告されましたが、ファイルが見つかりません: {local_path}")
+                      success = False # ファイルがないので失敗扱い
+
+            if success and local_path:
+                 logging.info(f"ダウンロード成功、ローカルパス: {local_path}")
+                 await status_manager.set_download_local_path(fc2_id, local_path)
+                 # ダウンロード完了状態への更新 (アップロードキュー追加含む)
+                 await status_manager.update_download_progress(fc2_id, {"status": "finished", "local_path": local_path})
+            else:
+                 logging.error(f"ダウンロードワーカー失敗 (download_video_from_page から false または無効なパス): {fc2_id}")
+                 # status_manager 側でエラー状態にする (progress_callback経由でなければ)
+                 task_status = await status_manager.get_task_status(fc2_id) # status_manager.py で実装済み
+                 if task_status and not task_status.get('status', '').startswith('failed'):
+                      await status_manager.update_download_progress(fc2_id, {"status": "error", "message": "ダウンロード処理失敗"})
+
+        except Exception as e:
+            logging.error(f"ダウンロードワーカー実行中に予期せぬエラー: {fc2_id} - {e}", exc_info=True)
+            await status_manager.update_download_progress(fc2_id, {"status": "error", "message": f"予期せぬエラー: {e}"})
+
+
+async def upload_worker(fc2_id: str, task_info: dict):
+    """アップロードタスクを実行するワーカー"""
+    async with upload_semaphore:
+        if stop_requested_flag:
+            logging.info(f"停止リクエスト検出のため、アップロードをスキップ: {fc2_id}")
+            return
+
+        logging.info(f"アップロードワーカー開始: {fc2_id}")
+        local_path = task_info.get("local_path")
+        title = task_info.get("title")
+
+        if not local_path or not title:
+            logging.error(f"アップロード情報不足 (ローカルパスまたはタイトル): {fc2_id}")
+            await status_manager.update_upload_progress(fc2_id, {"status": "error", "message": "アップロード情報不足"})
+            return
+        if not os.path.exists(local_path):
+             logging.error(f"アップロード対象のローカルファイルが見つかりません: {local_path}")
+             await status_manager.update_upload_progress(fc2_id, {"status": "error", "message": "ローカルファイル不明"})
+             return
+
+        async def progress_callback(progress_data: Dict[str, Any]):
+            await status_manager.update_upload_progress(fc2_id, progress_data)
+
+        try:
+            success = await upload_to_server(
+                local_path,
+                title,
+                progress_callback=progress_callback
+            )
+
+            if success:
+                logging.info(f"アップロードワーカー完了 (成功またはスキップ): {fc2_id}")
+                # 成功した場合、ローカルファイルを削除 (オプション)
+                try:
+                    os.remove(local_path)
+                    logging.info(f"ローカルファイルを削除しました: {local_path}")
+                except OSError as e:
+                    logging.warning(f"ローカルファイルの削除に失敗しました: {local_path} - {e}")
+            else:
+                # upload_to_server が False を返した場合 (progress_callback でエラーになっていない場合)
+                logging.error(f"アップロードワーカー失敗 (upload_to_server から False): {fc2_id}")
+                task_status = await status_manager.get_task_status(fc2_id) # status_manager.py で実装済み
+                if task_status and not task_status.get('status', '').startswith('failed'):
+                     await status_manager.update_upload_progress(fc2_id, {"status": "error", "message": "アップロード処理失敗"})
+
+        except Exception as e:
+            logging.error(f"アップロードワーカー実行中に予期せぬエラー: {fc2_id} - {e}", exc_info=True)
+            await status_manager.update_upload_progress(fc2_id, {"status": "error", "message": f"予期せぬエラー: {e}"})
+
+
+async def main_background_loop():
+    """メインのバックグラウンド処理ループ"""
+    global background_tasks_running, stop_requested_flag
+    logging.info("メインバックグラウンドループを開始します。")
+    background_tasks_running = True
+    stop_requested_flag = False
+
+    try:
+        # 1. スクレイピング実行
+        logging.info("スクレイピングを開始します...")
+        processed_ids = await status_manager.get_processed_ids()
+        from .content_scraper import TARGET_URL, REQUIRED_DAYS_PASSED
+        one_month_ago = datetime.now() - timedelta(days=30)
+        eligible_videos = await scrape_eligible_videos(
+            TARGET_URL,
+            processed_ids,
+            max_pages=5,
+            oldest_date=one_month_ago
+        )
+
+        if stop_requested_flag:
+             logging.info("スクレイピング後に停止リクエストを検出。")
+             raise asyncio.CancelledError
+
+        # 2. ダウンロード対象をキューに追加 (キューサイズ制限付き)
+        logging.info(f"{len(eligible_videos)} 件の動画が見つかりました。キューに追加します (最大{MAX_QUEUE_SIZE}件)...")
+        added_count = 0
+        async with status_manager._lock:
+            current_dl_queue_size = len(status_manager.download_queue)
+            available_slots = MAX_QUEUE_SIZE - current_dl_queue_size
+
+        logging.debug(f"現在のダウンロードキューサイズ: {current_dl_queue_size}, 追加可能数: {available_slots}")
+
+        if available_slots > 0:
+            for video in eligible_videos[:available_slots]:
+                await status_manager.add_download_task(video)
+                added_count += 1
+                if stop_requested_flag: break
+            logging.info(f"{added_count} 件をダウンロードキューに追加しました。")
         else:
-            st.warning("URLを入力してください。")
+            logging.info("ダウンロードキューが満杯のため、今回はタスクを追加しません。")
 
-    # --- 実行制御セクション ---
-    st.header("実行制御")
-    col1, col2 = st.columns(2)
-    with col1:
-        # 実行中でなければ開始ボタンを表示
-        if not manager.is_running():
-            if st.button("ダウンロード開始", key="start_button"):
-                if not manager.download_queue.empty():
+
+        if stop_requested_flag:
+             logging.info("タスク追加後に停止リクエストを検出。")
+             raise asyncio.CancelledError
+
+        # ★★★ ログ追加 ★★★
+        logging.info("キュー追加完了、ワーカー実行ループへ移行します。")
+
+        # 3. ダウンロード/アップロードワーカーの実行ループ
+        active_workers: List[asyncio.Task] = []
+        logging.info("--- ワーカー実行ループ開始 ---")
+        loop_count = 0
+        while True:
+            loop_count += 1
+            logging.debug(f"--- ワーカー実行ループ {loop_count} 回目 ---")
+            if stop_requested_flag:
+                logging.info("ワーカー実行ループで停止リクエストを検出。")
+                break
+
+            # --- 新しいダウンロードタスクを開始 ---
+            current_download_workers = [t for t in active_workers if not t.done() and "download" in t.get_name()]
+            logging.debug(f"現在のダウンロードワーカー数: {len(current_download_workers)} / {MAX_CONCURRENT_DOWNLOADS}")
+            if len(current_download_workers) < MAX_CONCURRENT_DOWNLOADS:
+                async with status_manager._lock: # キューの状態を確認
+                    current_queue_ids = status_manager.download_queue.copy()
+                    logging.debug(f"次のDLタスク取得試行前 - キュー内容 ({len(current_queue_ids)}件): {current_queue_ids}")
+
+                next_dl_task_result = await status_manager.get_next_download_task()
+
+                if next_dl_task_result:
+                    fc2_id, next_dl_task_info = next_dl_task_result
+                    logging.info(f"ダウンロードタスク取得成功: {fc2_id}")
+                    logging.debug(f"取得したタスク情報: {next_dl_task_info}")
+                    if not next_dl_task_info or not isinstance(next_dl_task_info, dict):
+                         logging.error(f"取得したタスク情報が無効です: {fc2_id}, Info: {next_dl_task_info}")
+                         continue # 次のループへ
+
+                    logging.info(f"ダウンロードワーカータスクを作成中: {fc2_id}")
                     try:
-                        # 一時フォルダが実際に存在するか確認
-                        if not os.path.isdir(manager._temp_folder):
-                             st.error(f"一時フォルダが見つかりません: {manager._temp_folder}。設定を確認してください。")
-                        else:
-                            manager.start_download()
-                            st.info("ダウンロード処理を開始しました。")
-                            st.rerun() # ボタンの状態を更新
-                    except Exception as e:
-                        st.error(f"ダウンロード開始エラー: {e}")
-                        logging.error(f"ダウンロード開始中のエラー: {e}", exc_info=True)
+                        worker_task = asyncio.create_task(download_worker(fc2_id, next_dl_task_info), name=f"download-{fc2_id}")
+                        active_workers.append(worker_task)
+                        logging.info(f"ダウンロードワーカータスクを作成しました: {worker_task.get_name()}")
+                    except Exception as e_create:
+                         logging.error(f"ダウンロードワーカータスク作成中にエラー: {fc2_id} - {e_create}", exc_info=True)
+                else:
+                    logging.debug("get_next_download_task が None を返しました (キューが空 or 内部エラー)。")
+            else:
+                 logging.debug("ダウンロードワーカーが最大数に達しています。")
+
+
+            # --- 新しいアップロードタスクを開始 ---
+            current_upload_workers = [t for t in active_workers if not t.done() and "upload" in t.get_name()]
+            logging.debug(f"現在のアップロードワーカー数: {len(current_upload_workers)} / {MAX_CONCURRENT_UPLOADS}")
+            if len(current_upload_workers) < MAX_CONCURRENT_UPLOADS:
+                async with status_manager._lock: # キューの状態を確認
+                    current_ul_queue_ids = status_manager.upload_queue.copy()
+                    logging.debug(f"次のULタスク取得試行前 - キュー内容 ({len(current_ul_queue_ids)}件): {current_ul_queue_ids}")
+
+                next_ul_task_result = await status_manager.get_next_upload_task()
+                if next_ul_task_result:
+                    fc2_id, next_ul_task_info = next_ul_task_result
+                    logging.info(f"アップロードタスク取得成功: {fc2_id}")
+                    logging.debug(f"取得したタスク情報: {next_ul_task_info}")
+                    if not next_ul_task_info or not isinstance(next_ul_task_info, dict):
+                         logging.error(f"取得したアップロードタスク情報が無効です: {fc2_id}, Info: {next_ul_task_info}")
+                         continue
+                    
+                    logging.info(f"アップロードワーカータスクを作成中: {fc2_id}")
+                    try:
+                        worker_task = asyncio.create_task(upload_worker(fc2_id, next_ul_task_info), name=f"upload-{fc2_id}")
+                        active_workers.append(worker_task)
+                        logging.info(f"アップロードワーカータスクを作成しました: {worker_task.get_name()}")
+                    except Exception as e_create_ul:
+                         logging.error(f"アップロードワーカータスク作成中にエラー: {fc2_id} - {e_create_ul}", exc_info=True)
 
                 else:
-                    st.warning("ダウンロードキューが空です。")
-        else:
-            st.button("ダウンロード開始", key="start_button_disabled", disabled=True) # 実行中は無効化
-
-    with col2:
-         # 実行中であればキャンセルボタンを表示
-        if manager.is_running():
-            if st.button("ダウンロード中断", key="cancel_button"):
-                manager.cancel_download()
-                st.warning("ダウンロードの中断を要求しました。")
-                st.rerun() # ボタンの状態を更新
-        else:
-             st.button("ダウンロード中断", key="cancel_button_disabled", disabled=True) # 停止中は無効化
+                    logging.debug("get_next_upload_task が None を返しました (キューが空 or 内部エラー)。")
+            else:
+                 logging.debug("アップロードワーカーが最大数に達しています。")
 
 
-    # --- 進捗表示セクション ---
-    st.header("現在のダウンロード進捗")
-    progress_data = manager.get_progress()
-    status = progress_data.get("status", "idle")
-    percentage = progress_data.get("percentage", 0)
-    filename = progress_data.get("filename", "")
-    error_msg = progress_data.get("error")
-    current_url = progress_data.get("url", "")
+            # --- 完了したワーカーをリストから削除 ---
+            done_workers = [t for t in active_workers if t.done()]
+            if done_workers:
+                 logging.debug(f"{len(done_workers)} 件の完了したワーカーを検出。")
+                 for t in done_workers:
+                     try:
+                         t.result()
+                         logging.debug(f"ワーカー {t.get_name()} は正常に完了しました。")
+                     except asyncio.CancelledError:
+                         logging.debug(f"ワーカー {t.get_name()} はキャンセルされました。")
+                     except Exception as e_done:
+                         logging.error(f"ワーカー {t.get_name()} で例外が発生しました: {e_done}", exc_info=True)
 
-    if status == "downloading":
-        st.info(f"ダウンロード中: {filename} ({current_url})")
-        st.progress(int(percentage))
-        st.write(f"{percentage:.2f}%")
-    elif status == "starting":
-        st.info(f"開始中: {current_url}")
-        st.progress(0)
-    elif status == "finished":
-        st.success(f"完了: {filename}")
-        st.progress(100)
-    elif status == "cancelling":
-        st.warning(f"キャンセル中: {filename} ({current_url})")
-        st.progress(int(percentage)) # キャンセル時点の進捗を表示
-    elif status == "cancelled":
-        st.warning(f"キャンセル完了: {filename} ({current_url})")
-    elif status == "error":
-        st.error(f"エラー: {filename} ({current_url}) - {error_msg}")
-    elif status == "idle":
-        st.write("待機中")
-    else:
-         st.write(f"不明なステータス: {status}")
+            active_workers = [t for t in active_workers if not t.done()]
+            logging.debug(f"アクティブなワーカー数 (完了削除後): {len(active_workers)}")
 
+            # --- 終了条件のチェック ---
+            current_status = await status_manager.get_all_status()
+            logging.debug(f"現在のキュー状況: DL={current_status['download_queue_count']}, UL={current_status['upload_queue_count']}")
+            if current_status['download_queue_count'] == 0 and \
+               current_status['upload_queue_count'] == 0 and \
+               not active_workers:
+                logging.info("すべてのキューが空になり、アクティブなワーカーもありません。ループを終了します。")
+                break
 
-    # --- キュー表示セクション ---
-    st.header("ダウンロードキュー")
-    queue_items = manager.get_queue_status()
-    if queue_items:
-        # DataFrameで見やすく表示
-        import pandas as pd
-        df_queue = pd.DataFrame(queue_items)
-        st.dataframe(df_queue[['url', 'quality', 'status']], use_container_width=True)
-    else:
-        st.write("キューは空です。")
+            logging.debug("ループ待機 (1秒)...")
+            await asyncio.sleep(1)
 
-    # --- 履歴表示セクション ---
-    st.header("ダウンロード履歴")
-    history_items = manager.get_history()
-    if history_items:
-        # DataFrameで見やすく表示
-        import pandas as pd
-        df_history = pd.DataFrame(history_items)
-        # UNIXタイムスタンプを日時に変換
-        df_history['timestamp'] = pd.to_datetime(df_history['timestamp'], unit='s').dt.tz_localize('UTC').dt.tz_convert('Asia/Tokyo')
-        st.dataframe(df_history[['timestamp', 'filename', 'status', 'quality', 'url', 'error']], use_container_width=True)
-    else:
-        st.write("履歴はありません。")
+    except asyncio.CancelledError:
+        logging.info("メインバックグラウンドループがキャンセルされました。")
+        for task in active_workers:
+            if not task.done():
+                task.cancel()
+        if active_workers:
+             await asyncio.gather(*[t for t in active_workers if not t.done()], return_exceptions=True)
+             logging.info("実行中のワーカーをキャンセルしました。")
 
-    # 定期的に画面を更新して進捗を表示 (ダウンロード実行中のみ)
-    if manager.is_running():
-        time.sleep(1) # ポーリング間隔
-        st.rerun()
+    except Exception as e:
+        logging.error(f"メインバックグラウンドループで予期せぬエラーが発生しました: {e}", exc_info=True)
+    finally:
+        logging.info("メインバックグラウンドループが終了しました。")
+        background_tasks_running = False
+        stop_requested_flag = False
 
 
+# --- API エンドポイント ---
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    """フロントエンドのHTMLページを返す"""
+    if 'templates' not in globals():
+         return HTMLResponse("<html><body>Template engine not configured.</body></html>")
+    context = {"request": request, "title": "tk-auto-dl"}
+    return templates.TemplateResponse("index.html", context)
+
+@app.get("/status")
+async def get_status():
+    """現在の処理状況を返す"""
+    current_status = await status_manager.get_all_status()
+    return JSONResponse(content={
+        "background_running": background_tasks_running,
+        "stop_requested": stop_requested_flag,
+        **current_status
+    })
+
+@app.post("/start")
+async def start_processing(background_tasks: BackgroundTasks):
+    """バックグラウンド処理を開始する"""
+    global background_tasks_running, main_task_handle
+    if background_tasks_running:
+        raise HTTPException(status_code=400, detail="処理は既に実行中です。")
+
+    logging.info("バックグラウンド処理の開始リクエストを受け付けました。")
+    # ここでタスクステータスをリセット
+    await status_manager.reset_state_async()
+    main_task_handle = asyncio.create_task(main_background_loop(), name="main_loop")
+    return JSONResponse(content={"message": "バックグラウンド処理を開始しました。"})
+
+@app.post("/stop")
+async def stop_processing():
+    """バックグラウンド処理の中断をリクエストする"""
+    global stop_requested_flag
+    if not background_tasks_running:
+        raise HTTPException(status_code=400, detail="処理は実行されていません。")
+
+    logging.info("バックグラウンド処理の停止リクエストを受け付けました。")
+    stop_requested_flag = True
+    await status_manager.request_stop()
+    return JSONResponse(content={"message": "処理の中断をリクエストしました。完了まで時間がかかる場合があります。"})
+
+
+@app.post("/resume")
+async def resume_processing(background_tasks: BackgroundTasks):
+    """中断された処理を再開する"""
+    global background_tasks_running, main_task_handle
+    if background_tasks_running:
+        raise HTTPException(status_code=400, detail="処理は既に実行中です。")
+
+    logging.info("処理の再開リクエストを受け付けました。")
+    stop_requested_flag = False
+    await status_manager.clear_stop_request()
+    await status_manager.resume_paused_tasks()
+    main_task_handle = asyncio.create_task(main_background_loop(), name="main_loop_resume")
+    return JSONResponse(content={"message": "処理を再開しました。"})
+
+
+@app.post("/reset_failed")
+async def reset_failed():
+     """失敗したタスクをリセットする"""
+     logging.info("失敗したタスクのリセットリクエストを受け付けました。")
+     await status_manager.reset_failed_tasks()
+     return JSONResponse(content={"message": "失敗したタスクをリセットし、キューに戻しました。"})
+
+
+# --- Uvicorn で実行する場合 ---
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    # ダミーメソッドの追加を削除 (status_manager.py で実装済みのため)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
