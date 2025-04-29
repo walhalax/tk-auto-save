@@ -1,6 +1,0 @@
-[build]
-command = "python build.py"
-directory = "public"
-
-[pages]
-build_output_directory = "public"
