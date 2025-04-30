@@ -350,7 +350,7 @@ async def main_background_loop():
             logging.debug(f"停止リクエストフラグ (終了チェック前): {stop_requested_flag}") # デバッグログ維持
 
             # 終了条件のチェック: アクティブなワーカーがいない場合のみループを終了
-            if not active_workers:
+            if not active_workers and len(status_manager.download_queue) == 0 and len(status_manager.upload_queue) == 0:
                 logging.info("アクティブなワーカーがいません。メインバックグラウンドループを終了します。")
                 break
             
@@ -407,6 +407,33 @@ async def main_background_loop():
 
 
 # --- API エンドポイント ---
+async def get_download_queue_stats():
+    """ダウンロードキューの統計情報を取得"""
+    async with status_lock:
+        return {
+            "queue_count": len(download_queue._queue),
+            "active_workers": download_queue._format_active_workers(),
+            "total_processed": download_queue._total_processed,
+            "total_errors": download_queue._total_errors
+        }
+
+async def get_upload_queue_stats():
+    """アップロードキューの統計情報を取得"""
+    async with status_lock:
+        return {
+            "queue_count": len(upload_queue._queue),
+            "active_workers": upload_queue._format_active_workers(),
+            "total_processed": upload_queue._total_processed,
+            "total_errors": upload_queue._total_errors
+        }
+
+async def get_worker_stats():
+    """ワーカーの状態を取得"""
+    async with status_lock:
+        return {
+            "active_workers": active_workers,
+            "total_workers": total_workers
+        }
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
@@ -470,57 +497,3 @@ async def start_processing(background_tasks: BackgroundTasks):
     logging.info("バックグラウンド処理の開始リクエストを受け付けました。")
     logging.debug(f"start_processing 実行時のstop_requested_flag: {stop_requested_flag}") # デバッグログ維持
     logging.debug(f"start_processing 実行時のbackground_tasks_running: {background_tasks_running}") # デバッグログ維持
-
-    # Auto Start 時にリセットではなくレジュームを行うため、reset_state_async() は削除
-    # await status_manager.reset_state_async() # 削除済み
-
-    # ダウンロードディレクトリをチェックし、既存ファイルに基づいてタスク状態を更新
-    await status_manager.check_and_resume_downloads("downloads") # ここに移動
-
-    # 中断されたタスクをレジュームキューに戻す
-    await status_manager.resume_paused_tasks()
-
-    main_task_handle = asyncio.create_task(main_background_loop(), name="main_loop")
-    return JSONResponse(content={"message": "バックグラウンド処理を開始しました。"})
-
-@app.post("/stop")
-async def stop_processing():
-    """バックグラウンド処理の中断をリクエストする"""
-    global stop_requested_flag, main_task_handle # main_task_handle を追加
-    if not background_tasks_running:
-        raise HTTPException(status_code=400, detail="処理は実行されていません。")
-
-    logging.info("バックグラウンド処理の停止リクエストを受け付けました。")
-    stop_requested_flag = True
-    await status_manager.request_stop()
-
-    # メインバックグラウンドタスクをキャンセル
-    if main_task_handle and not main_task_handle.done():
-        logging.info("メインバックグラウンドタスクのキャンセルを試みます。")
-        main_task_handle.cancel()
-        # キャンセルが完了するまで待つ必要はない（シャットダウン時に待機するため）
-
-    return JSONResponse(content={"message": "処理の中断をリクエストしました。完了まで時間がかかる場合があります。"})
-
-
-@app.post("/resume")
-async def resume_processing(background_tasks: BackgroundTasks):
-    """中断された処理を再開する"""
-    global background_tasks_running, main_task_handle
-    if background_tasks_running:
-        raise HTTPException(status_code=400, detail="処理は既に実行中です。")
-
-    logging.info("処理の再開リクエストを受け付けました。")
-    stop_requested_flag = False
-    await status_manager.clear_stop_request()
-    await status_manager.resume_paused_tasks()
-    main_task_handle = asyncio.create_task(main_background_loop(), name="main_loop_resume")
-    return JSONResponse(content={"message": "処理を再開しました。"})
-
-
-@app.post("/reset_failed")
-async def reset_failed():
-     """失敗したタスクをリセットする"""
-     logging.info("失敗したタスクのリセットリクエストを受け付けました。")
-     await status_manager.reset_failed_tasks()
-     return JSONResponse(content={"message": "失敗したタスクをリセットしました。"}) # 成功時のレスポンスを追加
