@@ -79,10 +79,6 @@
              errorMessageEl.textContent = ''; // Clear previous errors
             try {
                 const response = await fetch(endpoint, { method: 'POST' });
-if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP error! status: ${response.status}, message: ${text}`);
-}
                 const data = await response.json();
                 if (!response.ok) {
                     throw new Error(data.detail || `HTTP error! status: ${response.status}`);
@@ -92,14 +88,6 @@ if (!response.ok) {
                 // fetchStatus(); // 削除
             } catch (error) {
                 console.error(`Error calling ${endpoint}:`, error);
-console.error(`Error calling ${endpoint}:`, error);
-                 // エラーオブジェクト自体がnullである可能性も考慮
-                 let errorMessage = error ? (error.message || 'Unknown error with message') : 'Unknown error';
-                 errorMessageEl.textContent = `Error: ${errorMessage}`;
-console.error(`Error calling ${endpoint}:`, error);
-                 // エラーオブジェクトのmessageプロパティが存在しない場合に備えてnullチェック
-                 let errorMessage = error ? (error.message || 'Unknown error with message') : 'Unknown error';
-                 errorMessageEl.textContent = `Error: ${errorMessage}`;
                 errorMessageEl.textContent = `Error: ${error.message}`;
             }
         }
