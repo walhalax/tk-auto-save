@@ -88,6 +88,10 @@
                 // fetchStatus(); // 削除
             } catch (error) {
                 console.error(`Error calling ${endpoint}:`, error);
+console.error(`Error calling ${endpoint}:`, error);
+                 // エラーオブジェクトのmessageプロパティが存在しない場合に備えてnullチェック
+                 const errorMessage = error.message ? error.message : 'Unknown error occurred';
+                 errorMessageEl.textContent = `Error: ${errorMessage}`;
                 errorMessageEl.textContent = `Error: ${error.message}`;
             }
         }

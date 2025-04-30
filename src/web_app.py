@@ -486,6 +486,11 @@ async def start_processing(background_tasks: BackgroundTasks):
 
     # Auto Start が押されたら、まず停止フラグを強制的に解除
     logging.info("Auto Start リクエスト: 停止フラグを強制解除します。") # ログ追加
+@app.post("/reset_failed")
+async def reset_failed_tasks():
+    """失敗したタスクをリセットする"""
+    await status_manager.reset_failed_tasks()
+    return JSONResponse(content={"status": "success"})
     stop_requested_flag = False
     await status_manager.clear_stop_request()
     logging.debug(f"停止フラグ解除後のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
