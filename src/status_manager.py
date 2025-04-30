@@ -23,6 +23,9 @@ class StatusManager:
         self.processed_ids: Set[str] = set()      # 完了/スキップ済みの fc2_id
         self.stop_requested: bool = False         # 停止リクエストフラグ
 
+        # 状態更新通知のためのイベント
+        self._status_updated_event = asyncio.Event()
+
         # 起動時にファイルから状態を読み込む
         asyncio.create_task(self._load_status())
 
@@ -54,7 +57,7 @@ class StatusManager:
                 logging.info("状態ファイルが見つかりません。新しい状態で開始します。")
                 self._reset_state()
             logging.debug("状態ファイルの読み込みを完了しました。") # デバッグログ追加
-
+            self._status_updated_event.set() # 読み込み完了時にもイベントをセット
 
     async def _save_status(self):
         """現在のステータスを状態ファイルに保存する"""
@@ -73,6 +76,7 @@ class StatusManager:
         except IOError as e:
             logging.error(f"状態ファイルの保存に失敗しました: {e}")
         logging.debug("状態ファイルの保存を完了しました。") # デバッグログ追加
+        self._status_updated_event.set() # 保存完了時にもイベントをセット
 
 
     def _reset_state(self):
@@ -93,6 +97,7 @@ class StatusManager:
             self._reset_state()
             await self._save_status()
             logging.info("タスクステータスのリセットが完了しました。") # ログ維持
+        self._status_updated_event.set() # リセット完了時にもイベントをセット
 
 
     async def add_download_task(self, video_info: Dict[str, Any]):
@@ -104,26 +109,88 @@ class StatusManager:
 
         async with self._lock:
             logging.debug(f"ダウンロードタスク追加処理開始: {fc2_id}") # デバッグログ追加
-            if fc2_id not in self.task_status and fc2_id not in self.processed_ids:
+
+            # ローカルファイルが既に存在するかチェック
+            # ファイル名を推測 (download_module のロジックに合わせる)
+            title = video_info.get('title', fc2_id)
+            safe_filename = "".join(c if c.isalnum() or c in (' ', '.', '_', '-') else '_' for c in title)
+            if not safe_filename.lower().endswith('.mp4'):
+                 safe_filename += '.mp4'
+            local_path = os.path.join("downloads", safe_filename)
+
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                logging.info(f"ローカルに既存ファイル '{local_path}' を検出。ダウンロードをスキップし、ダウンロード完了としてマーク、アップロードキューに追加します。") # ログ維持
+                
+                # タスクが task_status に存在しない場合は新しく作成
+                if fc2_id not in self.task_status:
+                     self.task_status[fc2_id] = {
+                         "title": title,
+                         "url": video_info.get('url'), # 元のURLは保持
+                         "added_date": video_info.get('added_date_str'),
+                         "rating": video_info.get('rating'),
+                         "upload_progress": 0,
+                         "error_message": None,
+                     }
+
+                # タスクの状態を completed に設定し、ローカルパスとダウンロード進捗を更新
+                self.task_status[fc2_id].update({
+                    "status": "completed", # ダウンロード完了としてマーク
+                    "download_progress": 100.0,
+                    "local_path": local_path, # 既存のローカルパスを設定
+                    "last_updated": datetime.now().isoformat()
+                })
+
+                # processed_ids に含まれている場合は削除 (再度処理させるため)
+                if fc2_id in self.processed_ids:
+                    self.processed_ids.remove(fc2_id)
+                    logging.debug(f"タスク {fc2_id} をprocessed_idsから削除しました。") # デバッグログ追加
+
+                # アップロードキューに存在しない場合のみ追加
+                if fc2_id not in self.upload_queue:
+                    self.upload_queue.append(fc2_id)
+                    logging.info(f"アップロードキューに追加: {fc2_id} - {title}") # ログ維持
+                else:
+                    logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。") # デバッグログ維持
+
+                await self._save_status() # 状態を保存
+                logging.debug(f"タスク {fc2_id} をダウンロード完了としてマークし、アップロードキューに追加しました。状態を保存。") # デバッグログ追加
+                self._status_updated_event.set() # 状態変更時にイベントをセット
+                return # 処理終了
+
+            # ローカルファイルが存在しない、またはサイズが0の場合、ダウンロードタスクとして追加/更新
+            # タスクが task_status に存在しない、または状態が pending_download/downloading でない場合
+            if fc2_id not in self.task_status or (self.task_status[fc2_id].get("status") not in ["pending_download", "downloading"]):
+                logging.info(f"タスク {fc2_id} をダウンロードキューに追加/更新します。") # ログ維持
                 self.task_status[fc2_id] = {
                     "status": "pending_download",
-                    "title": video_info.get('title'),
+                    "title": title,
                     "url": video_info.get('url'),
                     "added_date": video_info.get('added_date_str'),
                     "rating": video_info.get('rating'),
                     "download_progress": 0,
                     "upload_progress": 0,
-                    "local_path": None,
+                    "local_path": None, # 新規ダウンロードの場合はローカルパスをリセット
                     "error_message": None,
                     "last_updated": datetime.now().isoformat() # ここで datetime を使用
                 }
-                self.download_queue.append(fc2_id)
-                logging.info(f"ダウンロードキューに追加: {fc2_id} - {video_info.get('title')}") # ログ維持
+                # processed_ids に含まれている場合は削除
+                if fc2_id in self.processed_ids:
+                    self.processed_ids.remove(fc2_id)
+                    logging.debug(f"タスク {fc2_id} をprocessed_idsから削除しました。") # デバッグログ追加
+
+                # ダウンロードキューに存在しない場合のみ追加
+                if fc2_id not in self.download_queue:
+                    self.download_queue.append(fc2_id)
+                    logging.info(f"ダウンロードキューに追加: {fc2_id} - {title}") # ログ維持
+                else:
+                    logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。") # デバッグログ維持
+
                 await self._save_status() # 状態を保存
-                logging.debug(f"ダウンロードタスク {fc2_id} を追加し、状態を保存しました。") # デバッグログ追加
+                logging.debug(f"タスク {fc2_id} をダウンロードキューに追加/更新し、状態を保存しました。") # デバッグログ追加
             else:
-                logging.debug(f"タスクは既に存在するか処理済みです: {fc2_id}") # ログ維持
+                logging.debug(f"タスク {fc2_id} は既にダウンロード待ちまたはダウンロード中です。スキップ。") # デバッグログ維持
             logging.debug(f"ダウンロードタスク追加処理完了: {fc2_id}") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def get_next_download_task(self) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -164,7 +231,8 @@ class StatusManager:
                 # キューから削除されたので、状態保存は不要
                 logging.debug("次のダウンロードタスク取得処理完了 (タスク不明)。") # デバッグログ追加
                 return None # 見つからない場合はNoneを返す
-            
+
+
     async def update_download_progress(self, fc2_id: str, progress_data: Dict[str, Any]):
         """ダウンロードの進捗や状態を更新する"""
         async with self._lock:
@@ -214,6 +282,7 @@ class StatusManager:
             else:
                 logging.warning(f"進捗更新対象のタスクが見つかりません: {fc2_id}") # ログ維持
                 logging.debug(f"ダウンロード進捗更新処理完了: {fc2_id} - タスクが見つかりませんでした。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def set_download_local_path(self, fc2_id: str, local_path: str):
@@ -229,6 +298,7 @@ class StatusManager:
             else:
                 logging.warning(f"ローカルパス設定対象のタスクが見つかりません: {fc2_id}") # ログ維持
                 logging.debug(f"ローカルパス設定処理完了: {fc2_id} - タスクが見つかりませんでした。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def get_next_upload_task(self) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -268,6 +338,8 @@ class StatusManager:
                 logging.warning(f"キューにあったID {fc2_id} が task_status に存在しません。") # ログ維持
                 logging.debug("次のアップロードタスク取得処理完了 (タスク不明)。") # デバッグログ追加
                 return None
+        self._status_updated_event.set() # 状態変更時にイベントをセット
+
 
     async def update_upload_progress(self, fc2_id: str, progress_data: Dict[str, Any]):
         """アップロードの進捗や状態を更新する"""
@@ -304,6 +376,7 @@ class StatusManager:
             else:
                 logging.warning(f"進捗更新対象のタスクが見つかりません: {fc2_id}") # ログ維持
                 logging.debug(f"アップロード進捗更新処理完了: {fc2_id} - タスクが見つかりませんでした。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def get_all_status(self) -> Dict[str, Any]:
@@ -320,9 +393,9 @@ class StatusManager:
                     task_info["progress"] = task_info.get("download_progress", 0)
                 elif status == "uploading":
                     task_info["progress"] = task_info.get("upload_progress", 0)
-                elif status == "completed" or status == "skipped":
+                elif status == "completed" or status == "skipped_upload": # skipped_upload も完了扱い
                      # 完了/スキップの場合は100%または0%など、適切な値を設定
-                     task_info["progress"] = 100.0 if status == "completed" else 0.0
+                     task_info["progress"] = 100.0 if status == "completed" or status == "skipped_upload" else 0.0
                 else:
                     task_info["progress"] = 0.0 # その他の状態では0%
 
@@ -339,7 +412,7 @@ class StatusManager:
         async with self._lock:
             logging.debug("処理済みID取得処理開始/完了。") # デバッグログ追加
             return self.processed_ids.copy()
-            
+
     async def get_task_status(self, fc2_id: str) -> Optional[Dict[str, Any]]:
         """指定されたタスクの現在のステータスを返す"""
         async with self._lock:
@@ -353,8 +426,8 @@ class StatusManager:
                      task_copy["progress"] = task_copy.get("download_progress", 0)
                  elif status == "uploading":
                      task_copy["progress"] = task_copy.get("upload_progress", 0)
-                 elif status == "completed" or status == "skipped":
-                      task_copy["progress"] = 100.0 if status == "completed" else 0.0
+                 elif status == "completed" or status == "skipped_upload": # skipped_upload も完了扱い
+                      task_copy["progress"] = 100.0 if status == "completed" or status == "skipped_upload" else 0.0
                  else:
                      task_copy["progress"] = 0.0
                  logging.debug(f"タスクステータス取得処理完了: {fc2_id} - タスク見つかりました。") # デバッグログ追加
@@ -370,6 +443,7 @@ class StatusManager:
             self.stop_requested = True
             logging.info("停止リクエストを受け付けました。") # ログ維持
             logging.debug("停止リクエスト処理完了。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def clear_stop_request(self):
@@ -379,6 +453,7 @@ class StatusManager:
             self.stop_requested = False
             logging.info("停止リクエストをクリアしました。") # ログ維持
             logging.debug("停止リクエストクリア処理完了。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def resume_paused_tasks(self):
@@ -437,7 +512,9 @@ class StatusManager:
                 logging.debug(f"レジューム処理後のdownload_queue: {list(self.download_queue)}") # デバッグログ維持
                 logging.debug(f"レジューム処理後のupload_queue: {list(self.upload_queue)}") # デバッグログ維持
                 await self._save_status()
-            logging.info("中断されたタスクのレジューム処理を完了しました。") # ログ追加
+                logging.info("中断されたタスクのレジューム処理を完了しました。") # ログ追加
+            logging.debug("resume_paused_tasks 処理完了。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def reset_failed_tasks(self):
@@ -446,7 +523,7 @@ class StatusManager:
             logging.debug("失敗タスクリセット処理開始。") # デバッグログ追加
             reset_count = 0
             ids_to_process = list(self.task_status.keys())
-            
+
             # processed_ids から失敗したタスクのIDを一時的に削除
             failed_ids_in_processed = [
                 fc2_id for fc2_id, task in self.task_status.items()
@@ -469,7 +546,7 @@ class StatusManager:
                         task["download_progress"] = 0
                         task["upload_progress"] = 0
                         task["local_path"] = None
-                        task["error_message"] = None
+                        task["error_message"] = "孤立ファイル削除によるリセット"
                         task["last_updated"] = datetime.now().isoformat()
                         self.download_queue.appendleft(fc2_id) # 再試行のため先頭に追加
                         reset_count += 1
@@ -480,7 +557,7 @@ class StatusManager:
                         task["download_progress"] = 0
                         task["upload_progress"] = 0
                         task["local_path"] = None
-                        task["error_message"] = None
+                        task["error_message"] = "孤立ファイル削除によるリセット"
                         task["last_updated"] = datetime.now().isoformat()
                     logging.debug(f"タスク {fc2_id} のリセット処理完了。") # デバッグログ追加
 
@@ -491,6 +568,7 @@ class StatusManager:
                 logging.debug("失敗タスクリセット処理完了 - 状態を保存しました。") # デバッグログ追加
             else:
                 logging.debug("失敗タスクリセット処理完了 - 対象タスクなし。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def check_and_resume_downloads(self, download_dir: str):
@@ -662,6 +740,7 @@ class StatusManager:
             await self._save_status()
             logging.info("ダウンロードディレクトリのチェックとタスク状態の更新を完了しました。") # ログ追加
             logging.debug("check_and_resume_downloads 処理完了。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
     async def delete_local_file(self, fc2_id: str):
@@ -696,3 +775,9 @@ class StatusManager:
             else:
                 logging.warning(f"ローカルファイル削除対象のタスクが見つからないか、ローカルパスが設定されていません: {fc2_id}") # ログ維持
                 logging.debug(f"ローカルファイル削除処理完了: {fc2_id} - 対象なし。") # デバッグログ追加
+        self._status_updated_event.set() # 状態変更時にイベントをセット
+
+    async def wait_for_status_update(self):
+        """状態が更新されるまで待機する"""
+        self._status_updated_event.clear() # イベントをクリア
+        await self._status_updated_event.wait() # イベントがセットされるまで待機

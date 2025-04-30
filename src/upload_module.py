@@ -167,7 +167,7 @@ def _upload_file_smb(local_path: str, remote_path_pysmb: str, progress_callback:
         uploaded_size = 0
         chunk_size = 8192 # 8KB チャンク
         last_report_time = time.time()
-        report_interval = 0.5 # 0.5秒ごとに進捗報告
+        report_interval = 0.1 # 0.1秒ごとに進捗報告 (0.5から変更)
 
         if progress_callback:
             progress_callback({"status": "uploading", "percentage": 0, "message": "アップロード開始", "uploaded_bytes": 0, "total_bytes": local_file_size})

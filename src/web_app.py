@@ -1,10 +1,11 @@
 import asyncio
+import json
 from typing import Optional, List, Dict, Any # 型ヒント用
 
 import logging
 import os
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse # StreamingResponse をインポート
 from fastapi.staticfiles import StaticFiles # 静的ファイル配信用
 from fastapi.templating import Jinja2Templates # HTMLテンプレート用
 from contextlib import asynccontextmanager # lifespan用 (FastAPI 0.90.0+)
@@ -206,7 +207,7 @@ async def main_background_loop():
     try:
         # スタート時にダウンロードディレクトリをチェックし、レジューム可能なタスクを探す
         # Auto Start 時にリセットではなくレジュームを行うため、reset_state_async() は削除
-        # await status_manager.check_and_resume_downloads("downloads") # start_processing に移動
+        # await status_manager.check_and_resume_downloads("downloads") # start エンドポイントに移動
 
         # 1. スクレイピング実行
         logging.info("スクレイピングを開始します...")
@@ -230,7 +231,7 @@ async def main_background_loop():
         async with status_manager._lock:
             current_dl_queue_size = len(status_manager.download_queue)
             available_slots = MAX_QUEUE_SIZE - current_dl_queue_size
-
+        
         logging.debug(f"現在のダウンロードキューサイズ: {current_dl_queue_size}, 追加可能数: {available_slots}")
 
         if available_slots > 0:
@@ -265,38 +266,7 @@ async def main_background_loop():
                 logging.info("ワーカー実行ループで停止リクエストを検出。")
                 break
 
-            # --- 新しいダウンロードタスクを開始 ---
-            current_download_workers = [t for t in active_workers if not t.done() and "download" in t.get_name()]
-            logging.debug(f"現在のダウンロードワーカー数: {len(current_download_workers)} / {MAX_CONCURRENT_DOWNLOADS}")
-            if len(current_download_workers) < MAX_CONCURRENT_DOWNLOADS:
-                async with status_manager._lock: # キューの状態を確認
-                    current_queue_ids = status_manager.download_queue.copy()
-                    logging.debug(f"次のDLタスク取得試行前 - キュー内容 ({len(current_queue_ids)}件): {list(current_queue_ids)}") # デバッグログ追加
-
-                next_dl_task_result = await status_manager.get_next_download_task()
-
-                if next_dl_task_result:
-                    fc2_id, next_dl_task_info = next_dl_task_result
-                    logging.info(f"ダウンロードタスク取得成功: {fc2_id}")
-                    logging.debug(f"取得したタスク情報: {next_dl_task_info}")
-                    if not next_dl_task_info or not isinstance(next_dl_task_info, dict):
-                         logging.error(f"取得したタスク情報が無効です: {fc2_id}, Info: {next_dl_task_info}")
-                         continue # 次のループへ
-
-                    logging.info(f"ダウンロードワーカータスクを作成中: {fc2_id}")
-                    try:
-                        worker_task = asyncio.create_task(download_worker(fc2_id, next_dl_task_info), name=f"download-{fc2_id}")
-                        active_workers.append(worker_task)
-                        logging.info(f"ダウンロードワーカータスクを作成しました: {worker_task.get_name()}")
-                    except Exception as e_create:
-                         logging.error(f"ダウンロードワーカータスク作成中にエラー: {fc2_id} - {e_create}", exc_info=True)
-                else:
-                    logging.debug("get_next_download_task が None を返しました (キューが空 or 内部エラー)。")
-            else:
-                 logging.debug("ダウンロードワーカーが最大数に達しています。")
-
-
-            # --- 新しいアップロードタスクを開始 ---
+            # --- 新しいアップロードタスクを開始 (ダウンロードより優先) ---
             current_upload_workers = [t for t in active_workers if not t.done() and "upload" in t.get_name()]
             logging.debug(f"現在のアップロードワーカー数: {len(current_upload_workers)} / {MAX_CONCURRENT_UPLOADS}")
             if len(current_upload_workers) < MAX_CONCURRENT_UPLOADS:
@@ -326,6 +296,36 @@ async def main_background_loop():
             else:
                  logging.debug("アップロードワーカーが最大数に達しています。")
 
+            # --- 新しいダウンロードタスクを開始 ---
+            current_download_workers = [t for t in active_workers if not t.done() and "download" in t.get_name()]
+            logging.debug(f"現在のダウンロードワーカー数: {len(current_download_workers)} / {MAX_CONCURRENT_DOWNLOADS}")
+            if len(current_download_workers) < MAX_CONCURRENT_DOWNLOADS:
+                async with status_manager._lock: # キューの状態を確認
+                    current_dl_queue_ids = status_manager.download_queue.copy()
+                    logging.debug(f"次のDLタスク取得試行前 - キュー内容 ({len(current_dl_queue_ids)}件): {list(current_dl_queue_ids)}") # デバッグログ追加
+
+                next_dl_task_result = await status_manager.get_next_download_task()
+
+                if next_dl_task_result:
+                    fc2_id, next_dl_task_info = next_dl_task_result
+                    logging.info(f"ダウンロードタスク取得成功: {fc2_id}")
+                    logging.debug(f"取得したタスク情報: {next_dl_task_info}")
+                    if not next_dl_task_info or not isinstance(next_dl_task_info, dict):
+                         logging.error(f"取得したタスク情報が無効です: {fc2_id}, Info: {next_dl_task_info}")
+                         continue # 次のループへ
+
+                    logging.info(f"ダウンロードワーカータスクを作成中: {fc2_id}")
+                    try:
+                        worker_task = asyncio.create_task(download_worker(fc2_id, next_dl_task_info), name=f"download-{fc2_id}")
+                        active_workers.append(worker_task)
+                        logging.info(f"ダウンロードワーカータスクを作成しました: {worker_task.get_name()}")
+                    except Exception as e_create:
+                         logging.error(f"ダウンロードワーカータスク作成中にエラー: {fc2_id} - {e_create}", exc_info=True)
+                else:
+                    logging.debug("get_next_download_task が None を返しました (キューが空 or 内部エラー)。")
+            else:
+                 logging.debug("ダウンロードワーカーが最大数に達しています。")
+
 
             # --- 完了したワーカーをリストから削除 ---
             done_workers = [t for t in active_workers if t.done()]
@@ -349,10 +349,9 @@ async def main_background_loop():
             logging.debug(f"アクティブなワーカー数 (終了チェック前): {len(active_workers)}") # デバッグログ維持
             logging.debug(f"停止リクエストフラグ (終了チェック前): {stop_requested_flag}") # デバッグログ維持
 
-            if current_status['download_queue_count'] == 0 and \
-               current_status['upload_queue_count'] == 0 and \
-               not active_workers:
-                logging.info("すべてのキューが空になり、アクティブなワーカーもありません。ループを終了します。")
+            # 終了条件のチェック: アクティブなワーカーがいない場合のみループを終了
+            if not active_workers:
+                logging.info("アクティブなワーカーがいません。メインバックグラウンドループを終了します。")
                 break
             
             # Stopリクエストがあった場合、キューが空でなくてもループを終了
@@ -417,15 +416,41 @@ async def read_root(request: Request):
     context = {"request": request, "title": "tk-auto-dl"}
     return templates.TemplateResponse("index.html", context)
 
-@app.get("/status")
-async def get_status():
-    """現在の処理状況を返す"""
-    current_status = await status_manager.get_all_status()
-    return JSONResponse(content={
-        "background_running": background_tasks_running,
-        "stop_requested": stop_requested_flag,
-        **current_status
-    })
+# 既存の /status エンドポイントは削除またはコメントアウト
+# @app.get("/status")
+# async def get_status():
+#     """現在の処理状況を返す"""
+#     current_status = await status_manager.get_all_status()
+#     return JSONResponse(content={
+#         "background_running": background_tasks_running,
+#         "stop_requested": stop_requested_flag,
+#         **current_status
+#     })
+
+@app.get("/status-stream")
+async def status_stream(request: Request):
+    """現在の処理状況をSSEでストリーム配信する"""
+    async def event_generator():
+        while True:
+            # クライアントが切断されたかチェック
+            if await request.is_disconnected():
+                logging.info("SSE クライアントが切断されました。")
+                break
+
+            # StatusManager の状態更新を待機
+            await status_manager.wait_for_status_update()
+
+            # 最新のステータスを取得
+            current_status = await status_manager.get_all_status()
+
+            # データをSSEフォーマットで送信
+            yield f"data: {json.dumps(current_status)}\n\n"
+
+            # 短時間待機してCPU使用率を抑える (必須ではないが推奨)
+            await asyncio.sleep(0.1)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 @app.post("/start")
 async def start_processing(background_tasks: BackgroundTasks):
@@ -498,11 +523,4 @@ async def reset_failed():
      """失敗したタスクをリセットする"""
      logging.info("失敗したタスクのリセットリクエストを受け付けました。")
      await status_manager.reset_failed_tasks()
-     return JSONResponse(content={"message": "失敗したタスクをリセットし、キューに戻しました。"})
-
-
-# --- Uvicorn で実行する場合 ---
-if __name__ == "__main__":
-    import uvicorn
-    # ダミーメソッドの追加を削除 (status_manager.py で実装済みのため)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+     return JSONResponse(content={"message": "失敗したタスクをリセットしました。"}) # 成功時のレスポンスを追加

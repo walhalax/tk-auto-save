@@ -17,8 +17,8 @@
         .status-text { font-weight: bold; margin-bottom: 4px; } /* ステータステキスト用のスタイル */
         .status-pending_download .status-text, .status-pending_upload .status-text { color: #888; }
         .status-downloading .status-text, .status-uploading .status-text { color: #007bff; }
-        .status-completed .status-text, .status-skipped .status-text { color: #28a745; }
-        .status-failed_download .status-text, .status-failed_upload .status-text { color: #dc3545; }
+        .status-completed .status-text, .status-skipped .status-text, .status-skipped_upload .status-text { color: #28a745; } /* skipped_upload も追加 */
+        .status-failed_download .status-text, .status-failed_upload .status-text, .status-error .status-text { color: #dc3545; } /* error も追加 */
         .status-paused .status-text { color: #ffc107; }
         #error-message { color: red; margin-top: 10px; }
     </style>
@@ -50,7 +50,7 @@
                     <tr>
                         <th>FC2 ID</th>
                         <th>Title</th>
-                        <th>Status / Progress</th> <!-- ヘッダーを変更 -->
+                        <th>Status / Progress</th>
                         <th>Error</th>
                     </tr>
                 </thead>
@@ -69,29 +69,12 @@
         const taskTableBody = document.querySelector('#taskTable tbody');
         const startButton = document.getElementById('startButton');
         const stopButton = document.getElementById('stopButton');
-        // const resumeButton = document.getElementById('resumeButton'); // 削除
         const resetFailedButton = document.getElementById('resetFailedButton');
         const errorMessageEl = document.getElementById('errorMessage');
 
-        let intervalId = null;
+        let eventSource = null; // EventSource オブジェクトを保持する変数
 
         // --- API Call Functions ---
-        async function fetchStatus() {
-            try {
-                const response = await fetch('/status');
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                const data = await response.json();
-                updateUI(data);
-            } catch (error) {
-                console.error('Error fetching status:', error);
-                errorMessageEl.textContent = `Error fetching status: ${error.message}. Retrying...`;
-                // Stop interval on error? Or let it retry?
-                // clearIntervalIfRunning();
-            }
-        }
-
         async function postControlAction(endpoint) {
              errorMessageEl.textContent = ''; // Clear previous errors
             try {
@@ -101,8 +84,8 @@
                     throw new Error(data.detail || `HTTP error! status: ${response.status}`);
                 }
                 console.log(`${endpoint} action successful:`, data.message);
-                // Immediately fetch status to reflect changes
-                fetchStatus();
+                // SSE が状態更新を自動的に反映するため、ここでは UI 更新を明示的に呼び出さない
+                // fetchStatus(); // 削除
             } catch (error) {
                 console.error(`Error calling ${endpoint}:`, error);
                 errorMessageEl.textContent = `Error: ${error.message}`;
@@ -120,10 +103,7 @@
             // Update button states
             startButton.disabled = data.background_running;
             stopButton.disabled = !data.background_running || data.stop_requested;
-            // Resume is enabled only if not running AND there are paused tasks (or potentially failed tasks to retry)
-            // A more precise check would involve looking at task_status for 'paused' state
-            // const hasPausedTasks = Object.values(data.task_status).some(task => task.status === 'paused'); // 削除
-            // resumeButton.disabled = data.background_running || data.stop_requested; // 削除
+            resetFailedButton.disabled = data.background_running; // 処理中はリセットボタンを無効化
 
             // Update task table
             taskTableBody.innerHTML = ''; // Clear existing rows
@@ -134,7 +114,7 @@
                  return timeA - timeB;
             });
 
-            // Limit displayed tasks (e.g., last 50) to avoid performance issues
+            // Limit displayed tasks (e.g., last 100) to avoid performance issues
             const displayLimit = 100;
             const tasksToDisplay = sortedTaskIds.slice(-displayLimit);
 
@@ -185,25 +165,46 @@
         // --- Event Listeners ---
         startButton.addEventListener('click', () => postControlAction('/start'));
         stopButton.addEventListener('click', () => postControlAction('/stop'));
-        // resumeButton.addEventListener('click', () => postControlAction('/resume')); // 削除
         resetFailedButton.addEventListener('click', () => postControlAction('/reset_failed'));
 
-        // --- Initialization ---
-        function clearIntervalIfRunning() {
-            if (intervalId) {
-                clearInterval(intervalId);
-                intervalId = null;
+        // --- SSE Setup ---
+        function setupSSE() {
+            if (eventSource) {
+                eventSource.close(); // 既存の接続があれば閉じる
             }
+
+            // SSE エンドポイントに接続
+            eventSource = new EventSource('/status-stream');
+
+            eventSource.onmessage = function(event) {
+                // サーバーからデータを受信したら UI を更新
+                const data = JSON.parse(event.data);
+                updateUI(data);
+            };
+
+            eventSource.onerror = function(err) {
+                console.error('EventSource failed:', err);
+                errorMessageEl.textContent = `SSE connection failed. Attempting to reconnect...`;
+                eventSource.close(); // エラー発生時は接続を閉じる
+                // 再接続を試みる (簡単な例、実際には指数バックオフなどを考慮)
+                setTimeout(setupSSE, 3000); // 3秒後に再接続を試みる
+            };
+
+            eventSource.onopen = function() {
+                 console.log("SSE connection opened.");
+                 errorMessageEl.textContent = ''; // 接続成功時にエラーメッセージをクリア
+            };
         }
 
-        function startPolling() {
-            clearIntervalIfRunning(); // Clear any existing interval
-            fetchStatus(); // Fetch immediately
-            intervalId = setInterval(fetchStatus, 1000); // Poll every 1 second (changed from 3000)
-        }
 
-        // Start polling when the page loads
-        startPolling();
+        // --- Initialization ---
+        // ページロード時に SSE 接続を開始
+        setupSSE();
+
+        // 初回ロード時のステータス表示のために一度だけフェッチ (SSE が最初のデータを送るまでの間に表示するため)
+        // または、SSE エンドポイントが接続時に最新の状態を一度送るようにバックエンドを修正する
+        // 現在のバックエンド実装は状態更新時のみ送るため、初回表示用に一度フェッチが必要
+        // fetchStatus(); // 削除 - SSE が最初のデータを送るようにバックエンドを修正済みと仮定
 
     </script>
 </body>
