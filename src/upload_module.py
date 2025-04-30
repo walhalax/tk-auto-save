@@ -258,11 +258,31 @@ async def upload_to_server(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> bool:
     """ダウンロードされたファイルを解析し、適切なフォルダにアップロードする"""
+# 0. ローカルファイルの存在確認とダウンロード完了チェック
+    if not local_file_path or not os.path.exists(local_file_path):
+        logging.warning(f"ローカルファイルが存在しません: {local_file_path} (ダウンロード中または削除済み)")
+        if progress_callback:
+            progress_callback({"status": "skipped", "message": "ローカルファイル未存在"})
+        return True  # スキップも成功扱い
+        
+    if local_file_path.endswith('.part'):
+        logging.info(f"ファイルはダウンロード中です: {local_file_path}")
+        if progress_callback:
+            progress_callback({"status": "skipped", "message": "ダウンロード中のファイルはスキップ"})
+        return True  # スキップも成功扱い
     logging.info(f"アップロード処理を開始: {local_file_path} (Title: {video_title})")
 
     # 1. タイトルからプレフィックスと完全IDを抽出
     prefix = extract_fc2_prefix(video_title)
     full_id = extract_fc2_full_id(video_title)
+# 1.5. タイトルからプレフィックスを修正 (FC2-PPV-XXX → FC2-PPV-XX0)
+    if prefix:
+        # 最後の3桁を取得 (例: "123")
+        number_part = prefix[-3:]
+        # 最後の桁を0に置換 (例: "12" + "0" → "120")
+        new_number = number_part[:2] + '0'
+        # 新しいプレフィックスを構築 (例: "FC2-PPV-120")
+        prefix = prefix[:-3] + new_number
 
     if not prefix:
         logging.error(f"タイトルからFC2-PPV-XXXプレフィックスが見つかりません: {video_title}")
