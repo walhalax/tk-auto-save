@@ -107,8 +107,11 @@ def _check_or_create_smb_directory(target_dir_pysmb: str):
             logging.info("SMB接続をクローズしました。")
 
 
-def _check_duplicate_smb(target_dir_pysmb: str, video_full_id: str) -> bool:
-    """SMBディレクトリ内に指定IDのファイルが存在するか確認する (同期)"""
+def _check_duplicate_smb(target_dir_pysmb: str, local_filename: str) -> Optional[int]:
+    """
+    SMBディレクトリ内に同名のファイルが存在するか確認し、存在する場合はそのファイルサイズを返す (同期)。
+    見つからない場合は None を返す。
+    """
     conn = None
     try:
         conn = _get_smb_connection()
@@ -116,27 +119,30 @@ def _check_duplicate_smb(target_dir_pysmb: str, video_full_id: str) -> bool:
         logging.info(f"SMB接続成功 (重複チェック): {FILEHUB_ADDRESS}")
 
         full_path = target_dir_pysmb
-        logging.info(f"SMBディレクトリ内の重複を確認中: {FILEHUB_SHARE}{full_path} for ID: {video_full_id}")
+        logging.info(f"SMBディレクトリ内の重複を確認中: {FILEHUB_SHARE}{full_path} for file: {local_filename}")
 
-        shared_files = conn.listPath(FILEHUB_SHARE, full_path)
-        for shared_file in shared_files:
-            if not shared_file.isDirectory:
-                # ファイル名に完全IDが含まれているかチェック (拡張子を除く)
-                if video_full_id in os.path.splitext(shared_file.filename)[0]:
-                    logging.info(f"重複ファイルを発見しました: {shared_file.filename} in {FILEHUB_SHARE}{full_path}")
-                    return True
-        logging.info(f"重複ファイルは見つかりませんでした。")
-        return False
+        # 指定されたファイル名で直接属性を取得してみる
+        remote_file_path = f"{full_path}/{local_filename}"
+        try:
+            attributes = conn.getAttributes(FILEHUB_SHARE, remote_file_path)
+            logging.info(f"重複ファイルを発見しました: {local_filename} in {FILEHUB_SHARE}{full_path}, Size: {attributes.file_size}")
+            return attributes.file_size
+        except OperationFailure as e:
+            # ファイルが存在しない場合のエラー (NT STATUS_OBJECT_NAME_NOT_FOUND など)
+            logging.debug(f"SMBファイル属性取得失敗 (ファイルなし?): {FILEHUB_SHARE}{remote_file_path} - {e}")
+            return None # ファイルが見つからない
+
     except OperationFailure as e:
          # ディレクトリが存在しない場合など
-         logging.warning(f"SMBディレクトリのリスト取得に失敗しました (重複チェック): {FILEHUB_SHARE}{full_path} - {e}")
-         return False # ディレクトリがない場合は重複なし
+         logging.warning(f"SMBディレクトリまたはファイルの操作に失敗しました (重複チェック): {FILEHUB_SHARE}{full_path} - {e}")
+         return None # ディレクトリがない場合もファイルは存在しないとみなす
     except ValueError as e:
          logging.error(f"設定エラー: {e}")
          raise
     except Exception as e:
-        logging.error(f"SMB重複チェック中に予期せぬエラーが発生しました: {target_dir_pysmb} - {e}", exc_info=True)
-        return True # 安全側に倒して重複ありとする
+        logging.error(f"SMB重複チェック中に予期せぬエラーが発生しました: {target_dir_pysmb}/{local_filename} - {e}", exc_info=True)
+        # 予期せぬエラーの場合は安全側に倒して None を返す (アップロードを試みる)
+        return None
     finally:
         if conn:
             conn.close()
@@ -169,17 +175,8 @@ def _upload_file_smb(local_path: str, remote_path_pysmb: str, progress_callback:
         with open(local_path, 'rb') as local_file:
             # storeFile はファイルオブジェクトを受け付けるが、進捗を得るためにはチャンクで読み込む
             # pysmb の storeFile はファイルオブジェクト全体を渡すため、進捗コールバックを内部でサポートしていない
-            # 進捗報告のためには、手動でチャンクを読み込み、SMBConnection.storeFileFromOffset を使う必要がある
-            # または、storeFile を使いつつ、別のスレッド/プロセスでファイルサイズの変化を監視する (複雑)
-
-            # ここでは、storeFile を使いつつ、開始時と終了時、および定期的な概算報告を行う
-            # より正確なリアルタイム進捗には pysmb の低レベルAPI または別のライブラリが必要
-            # 一旦、開始時、終了時、そして定期的な時間ベースの報告を実装
-
-            # storeFile を呼び出す前に、ファイルサイズを取得
-            # storeFile はファイル全体を一度に読み込むため、進捗コールバックは開始直後と完了直前にしか呼ばれない
             # リアルタイム性を出すには、ファイルをチャンクに分けて読み込み、SMBConnection.storeFileFromOffset を使う必要がある
-            # storeFileFromOffset はファイルオブジェクトとオフセット、サイズを受け取る
+            # storeFileFromOffset は BytesIO のような seek/read を持つオブジェクトを期待する
             # 例: conn.storeFileFromOffset(service_name, path, file_obj, offset, max_length)
 
             # storeFileFromOffset を使うように修正
@@ -255,26 +252,30 @@ def _upload_file_smb(local_path: str, remote_path_pysmb: str, progress_callback:
 async def upload_to_server(
     local_file_path: str,
     video_title: str,
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    progress_callback: Optional[Callable[[Dict[str, Any]], Any]] = None # 戻り値の型ヒントを Any に変更
 ) -> bool:
     """ダウンロードされたファイルを解析し、適切なフォルダにアップロードする"""
 # 0. ローカルファイルの存在確認とダウンロード完了チェック
     if not local_file_path or not os.path.exists(local_file_path):
         logging.warning(f"ローカルファイルが存在しません: {local_file_path} (ダウンロード中または削除済み)")
         if progress_callback:
+            # StatusManager にスキップを伝えるために progress_callback を呼び出す
             progress_callback({"status": "skipped", "message": "ローカルファイル未存在"})
-        return True  # スキップも成功扱い
-        
+        return True  # スキップも成功扱い (タスク完了とみなす)
+
     if local_file_path.endswith('.part'):
         logging.info(f"ファイルはダウンロード中です: {local_file_path}")
         if progress_callback:
+            # StatusManager にスキップを伝えるために progress_callback を呼び出す
             progress_callback({"status": "skipped", "message": "ダウンロード中のファイルはスキップ"})
-        return True  # スキップも成功扱い
+        return True  # スキップも成功扱い (タスク完了とみなす)
     logging.info(f"アップロード処理を開始: {local_file_path} (Title: {video_title})")
 
     # 1. タイトルからプレフィックスと完全IDを抽出
     prefix = extract_fc2_prefix(video_title)
+    # full_id は重複チェックには使わないが、ログのために残しておく
     full_id = extract_fc2_full_id(video_title)
+
 # 1.5. タイトルからプレフィックスを修正 (FC2-PPV-XXX → FC2-PPV-XX0)
     if prefix:
         # 最後の3桁を取得 (例: "123")
@@ -289,8 +290,6 @@ async def upload_to_server(
         if progress_callback:
             progress_callback({"status": "error", "message": "タイトルからプレフィックス抽出失敗"})
         return False
-    if not full_id:
-         logging.warning(f"タイトルからFC2-PPV-XXXXXXX完全IDが見つかりません (重複チェック不可): {video_title}")
 
     # 2. アップロード先ディレクトリパスを構築 (pysmb 用)
     # 例: /Adult/FC2-PPV-123
@@ -305,23 +304,37 @@ async def upload_to_server(
         # 4. ディレクトリ確認/作成 (非同期実行)
         await asyncio.to_thread(_check_or_create_smb_directory, target_dir_pysmb)
 
-        # 5. 重複チェック (完全IDがある場合のみ) (非同期実行)
-        if full_id:
-            is_duplicate = await asyncio.to_thread(_check_duplicate_smb, target_dir_pysmb, full_id)
-            if is_duplicate:
-                logging.info(f"ファイルは既にサーバーに存在するためスキップ: {full_id} in {target_dir_pysmb}")
-                if progress_callback:
-                    progress_callback({"status": "skipped", "message": "サーバーに重複ファイルあり"})
-                return True # スキップも成功扱い
+        # 5. 重複チェックと同名ファイルサイズ比較 (非同期実行)
+        # _check_duplicate_smb を呼び出し、リモートファイルサイズを取得
+        remote_file_size = await asyncio.to_thread(_check_duplicate_smb, target_dir_pysmb, local_filename)
 
-        # 6. ファイルアップロード (非同期実行)
-        # _upload_file_smb は同期関数なので asyncio.to_thread でラップ
+        if remote_file_size is not None:
+            # リモートに同名ファイルが存在する場合
+            local_file_size = os.path.getsize(local_file_path)
+            logging.info(f"リモートに同名ファイルが存在します: {local_filename}. ローカルサイズ: {local_file_size}, リモートサイズ: {remote_file_size}")
+
+            if remote_file_size >= local_file_size:
+                # リモートファイルの方が大きいか同じサイズの場合、アップロードをスキップ
+                logging.info(f"リモートファイルの方が大きいか同じサイズのため、アップロードをスキップします: {local_filename}")
+                if progress_callback:
+                    # StatusManager にスキップを伝えるために progress_callback を呼び出す
+                    progress_callback({"status": "skipped", "message": "サーバーに同名ファイル (サイズ大/同等) あり"})
+                return True # スキップも成功扱い (タスク完了とみなす)
+            else:
+                # ローカルファイルの方が小さい場合、上書きしてアップロードを続行
+                logging.info(f"ローカルファイルの方が小さいため、上書きしてアップロードを続行します: {local_filename}")
+                # そのままアップロード処理に進む (_upload_file_smb はデフォルトで上書き)
+
+        # 6. ファイルアップロード (非同期実行) - 重複がない場合、またはローカルファイルが小さい場合
         await asyncio.to_thread(_upload_file_smb, local_file_path, remote_file_path_pysmb, progress_callback)
 
         return True # アップロード成功
 
     except Exception as e:
         logging.error(f"アップロード処理全体でエラーが発生しました: {local_file_path} -> {target_dir_pysmb} - {e}", exc_info=True)
+        if progress_callback:
+             # エラー発生時も StatusManager にエラーを伝えるために progress_callback を呼び出す
+             progress_callback({"status": "error", "message": f"アップロード処理エラー: {e}"})
         return False
 
 
