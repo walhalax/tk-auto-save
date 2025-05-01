@@ -118,46 +118,61 @@ class StatusManager:
                  safe_filename += '.mp4'
             local_path = os.path.join("downloads", safe_filename)
 
+            # ファイルが存在し、かつサイズが0より大きい場合
             if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-                logging.info(f"ローカルに既存ファイル '{local_path}' を検出。ダウンロードをスキップし、ダウンロード完了としてマーク、アップロードキューに追加します。") # ログ維持
-                
-                # タスクが task_status に存在しない場合は新しく作成
-                if fc2_id not in self.task_status:
-                     self.task_status[fc2_id] = {
-                         "title": title,
-                         "url": video_info.get('url'), # 元のURLは保持
-                         "added_date": video_info.get('added_date_str'),
-                         "rating": video_info.get('rating'),
-                         "upload_progress": 0,
-                         "error_message": None,
-                     }
+                # ファイル名からFC2 IDを抽出して、タスクの状態を確認
+                extracted_fc2_id = self._extract_fc2_id_from_filename(safe_filename)
+                if extracted_fc2_id == fc2_id:
+                    task = self.task_status.get(fc2_id)
+                    # タスクが存在し、かつダウンロード完了、アップロード待ち、アップロード中、スキップアップロードの状態であればスキップ
+                    if task and task.get("status") in ["completed", "pending_upload", "uploading", "skipped_upload"]:
+                        logging.info(f"ローカルに既存ファイル '{local_path}' を検出。タスク {fc2_id} は既に処理済みまたは処理中のためスキップします。") # ログ維持
+                        logging.debug(f"タスク {fc2_id} は状態 '{task.get('status')}' で既に存在するためスキップ。") # デバッグログ追加
+                        self._status_updated_event.set() # 状態変更時にイベントをセット
+                        return # 処理終了
+                    elif task and task.get("status") in ["pending_download", "downloading", "paused", "error", "failed_download", "failed_upload"]:
+                         # ファイルは存在するが、タスクの状態がダウンロード中やエラーなどの場合
+                         logging.warning(f"ローカルに既存ファイル '{local_path}' を検出しましたが、タスク {fc2_id} の状態が '{task.get('status')}' です。タスクをリセットしてダウンロードキューに戻します。") # ログ維持
+                         # タスクをリセットしてダウンロードキューに戻す処理は check_and_resume_downloads で行うため、ここでは何もしない
+                         pass # check_and_resume_downloads に任せる
+                    else:
+                         # タスクが task_status に存在しない場合
+                         logging.info(f"ローカルに既存ファイル '{local_path}' を検出。タスク {fc2_id} が task_status に存在しないため、ダウンロード完了としてマークし、アップロードキューに追加します。") # ログ維持
+                         # タスクを新しく作成し、ダウンロード完了としてマーク
+                         self.task_status[fc2_id] = {
+                             "status": "completed", # ダウンロード完了としてマーク
+                             "title": title,
+                             "url": video_info.get('url'), # 元のURLは保持
+                             "added_date": video_info.get('added_date_str'),
+                             "rating": video_info.get('rating'),
+                             "download_progress": 100.0,
+                             "upload_progress": 0,
+                             "local_path": local_path, # 既存のローカルパスを設定
+                             "error_message": None,
+                             "last_updated": datetime.now().isoformat()
+                         }
+                         # processed_ids に含まれている場合は削除 (再度処理させるため)
+                         if fc2_id in self.processed_ids:
+                             self.processed_ids.remove(fc2_id)
+                             logging.debug(f"タスク {fc2_id} をprocessed_idsから削除しました。") # デバッグログ追加
 
-                # タスクの状態を completed に設定し、ローカルパスとダウンロード進捗を更新
-                self.task_status[fc2_id].update({
-                    "status": "completed", # ダウンロード完了としてマーク
-                    "download_progress": 100.0,
-                    "local_path": local_path, # 既存のローカルパスを設定
-                    "last_updated": datetime.now().isoformat()
-                })
+                         # アップロードキューに存在しない場合のみ追加
+                         if fc2_id not in self.upload_queue:
+                             self.upload_queue.append(fc2_id)
+                             logging.info(f"アップロードキューに追加: {fc2_id} - {title}") # ログ維持
+                         else:
+                             logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。") # デバッグログ維持
 
-                # processed_ids に含まれている場合は削除 (再度処理させるため)
-                if fc2_id in self.processed_ids:
-                    self.processed_ids.remove(fc2_id)
-                    logging.debug(f"タスク {fc2_id} をprocessed_idsから削除しました。") # デバッグログ追加
+                         await self._save_status() # 状態を保存
+                         logging.debug(f"タスク {fc2_id} をダウンロード完了としてマークし、アップロードキューに追加しました。状態を保存。") # デバッグログ追加
+                         self._status_updated_event.set() # 状態変更時にイベントをセット
+                         return # 処理終了
 
-                # アップロードキューに存在しない場合のみ追加
-                if fc2_id not in self.upload_queue:
-                    self.upload_queue.append(fc2_id)
-                    logging.info(f"アップロードキューに追加: {fc2_id} - {title}") # ログ維持
                 else:
-                    logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。") # デバッグログ維持
+                    logging.warning(f"ローカルに既存ファイル '{local_path}' を検出しましたが、ファイル名からFC2 ID '{fc2_id}' を抽出できませんでした。スキップせず、ダウンロードタスクとして追加/更新します。") # ログ維持
+                    # FC2 IDが一致しない場合は、既存ファイルと見なさず、ダウンロードタスクとして続行
 
-                await self._save_status() # 状態を保存
-                logging.debug(f"タスク {fc2_id} をダウンロード完了としてマークし、アップロードキューに追加しました。状態を保存。") # デバッグログ追加
-                self._status_updated_event.set() # 状態変更時にイベントをセット
-                return # 処理終了
-
-            # ローカルファイルが存在しない、またはサイズが0の場合、ダウンロードタスクとして追加/更新
+            # ローカルファイルが存在しない、またはサイズが0、または既存ファイルと見なされなかった場合、ダウンロードタスクとして追加/更新
             # タスクが task_status に存在しない、または状態が pending_download/downloading でない場合
             if fc2_id not in self.task_status or (self.task_status[fc2_id].get("status") not in ["pending_download", "downloading"]):
                 logging.info(f"タスク {fc2_id} をダウンロードキューに追加/更新します。") # ログ維持
@@ -183,7 +198,7 @@ class StatusManager:
                     self.download_queue.append(fc2_id)
                     logging.info(f"ダウンロードキューに追加: {fc2_id} - {title}") # ログ維持
                 else:
-                    logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。") # デバッグログ維持
+                    logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。スキップ。") # デバッグログ維持
 
                 await self._save_status() # 状態を保存
                 logging.debug(f"タスク {fc2_id} をダウンロードキューに追加/更新し、状態を保存しました。") # デバッグログ追加
@@ -281,7 +296,7 @@ class StatusManager:
                 logging.debug(f"ダウンロード進捗更新処理完了: {fc2_id} - 状態を保存しました。") # デバッグログ追加
             else:
                 logging.warning(f"進捗更新対象のタスクが見つかりません: {fc2_id}") # ログ維持
-                logging.debug(f"ダウンロード進捗更新処理完了: {fc2_id} - タスクが見つかりませんでした。") # デバッグログ追加
+                logging.debug(f"進捗更新対象のタスクが見つかりません: {fc2_id}") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
@@ -297,7 +312,7 @@ class StatusManager:
                 logging.debug(f"ローカルパス設定処理完了: {fc2_id} - 状態を保存しました。") # デバッグログ追加
             else:
                 logging.warning(f"ローカルパス設定対象のタスクが見つかりません: {fc2_id}") # ログ維持
-                logging.debug(f"ローカルパス設定処理完了: {fc2_id} - タスクが見つかりませんでした。") # デバッグログ追加
+                logging.debug(f"ローカルパス設定対象のタスクが見つかりません: {fc2_id}") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
@@ -375,7 +390,7 @@ class StatusManager:
                 logging.debug(f"アップロード進捗更新処理完了: {fc2_id} - 状態を保存しました。") # デバッグログ追加
             else:
                 logging.warning(f"進捗更新対象のタスクが見つかりません: {fc2_id}") # ログ維持
-                logging.debug(f"アップロード進捗更新処理完了: {fc2_id} - タスクが見つかりませんでした。") # デバッグログ追加
+                logging.debug(f"進捗更新対象のタスクが見つかりません: {fc2_id}") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
@@ -498,22 +513,16 @@ class StatusManager:
                             logging.info(f"中断されたダウンロードタスクを再開キューに追加: {fc2_id}") # ログ維持
                             logging.debug(f"タスク {fc2_id} をダウンロードキューに追加しました。") # デバッグログ追加
                         else:
-                            logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。状態をpending_downloadに更新。") # デバッグログ維持
+                            logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。状態のみ更新。") # デバッグログ維持
                             task["status"] = "pending_download" # 状態だけ更新
                             task["last_updated"] = datetime.now().isoformat()
-                elif task:
-                     logging.debug(f"タスク {fc2_id} はpaused状態ではありません ({task.get('status')})。レジューム処理スキップ。") # デバッグログ維持
-                else:
-                     logging.warning(f"タスク {fc2_id} がtask_statusに見つかりません。") # ログ維持
 
-            if resumed_dl > 0 or resumed_ul > 0:
-                logging.info(f"{resumed_dl}件のダウンロード、{resumed_ul}件のアップロードを再開キューに追加しました。") # ログ維持
-                logging.debug(f"レジューム処理後のtask_status: {json.dumps(self.task_status, indent=2)}") # デバッグログ維持
-                logging.debug(f"レジューム処理後のdownload_queue: {list(self.download_queue)}") # デバッグログ維持
-                logging.debug(f"レジューム処理後のupload_queue: {list(self.upload_queue)}") # デバッグログ維持
-                await self._save_status()
-                logging.info("中断されたタスクのレジューム処理を完了しました。") # ログ追加
-            logging.debug("resume_paused_tasks 処理完了。") # デバッグログ追加
+            logging.info(f"中断されたタスクのレジューム処理が完了しました。ダウンロード: {resumed_dl}件, アップロード: {resumed_ul}件") # ログ維持
+            logging.debug(f"レジューム処理完了時のtask_status: {json.dumps(self.task_status, indent=2)}") # デバッグログ維持
+            logging.debug(f"レジューム処理完了時のdownload_queue: {list(self.download_queue)}") # デバッグログ維持
+            logging.debug(f"レジューム処理完了時のupload_queue: {list(self.upload_queue)}") # デバッグログ維持
+            await self._save_status() # 状態を保存
+            logging.debug("中断されたタスクのレジューム処理完了。状態を保存しました。") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
@@ -521,225 +530,244 @@ class StatusManager:
         """'error', 'failed_download', 'failed_upload' 状態のタスクをリセットしてダウンロードキューに戻す"""
         async with self._lock:
             logging.debug("失敗タスクリセット処理開始。") # デバッグログ追加
-            reset_count = 0
-            ids_to_process = list(self.task_status.keys())
+            failed_statuses = ["error", "failed_download", "failed_upload"]
+            ids_to_reset = [fc2_id for fc2_id, task in self.task_status.items() if task.get("status") in failed_statuses]
+            logging.debug(f"リセット対象の失敗タスクID: {ids_to_reset}") # デバッグログ追加
 
-            # processed_ids から失敗したタスクのIDを一時的に削除
-            failed_ids_in_processed = [
-                fc2_id for fc2_id, task in self.task_status.items()
-                if task and (task.get("status", "").startswith("fail") or task.get("status") == "error")
-                and fc2_id in self.processed_ids
-            ]
+            # processed_ids に含まれている失敗タスクIDを削除
+            failed_ids_in_processed = [fc2_id for fc2_id in ids_to_reset if fc2_id in self.processed_ids]
             for fc2_id in failed_ids_in_processed:
-                self.processed_ids.remove(fc2_id)
-                logging.debug(f"processed_ids から失敗タスク {fc2_id} を一時削除") # ログ維持
+                 self.processed_ids.remove(fc2_id)
+                 logging.debug(f"失敗タスク {fc2_id} をprocessed_idsから削除しました。") # デバッグログ追加
 
 
-            for fc2_id in ids_to_process:
-                task = self.task_status.get(fc2_id)
-                if task and (task.get("status", "").startswith("fail") or task.get("status") == "error"):
-                    logging.debug(f"タスク {fc2_id} は失敗状態です。リセット処理開始。") # デバッグログ追加
-                    if fc2_id not in self.download_queue:
-                        logging.debug(f"タスク {fc2_id} はダウンロードキューにありません。リセットして追加します。") # デバッグログ追加
-                        # 状態をリセット
-                        task["status"] = "pending_download"
-                        task["download_progress"] = 0
-                        task["upload_progress"] = 0
-                        task["local_path"] = None
-                        task["error_message"] = "孤立ファイル削除によるリセット"
-                        task["last_updated"] = datetime.now().isoformat()
-                        self.download_queue.appendleft(fc2_id) # 再試行のため先頭に追加
-                        reset_count += 1
-                        logging.info(f"失敗したタスクをリセットし、ダウンロードキューに追加: {fc2_id}") # ログ維持
-                    else:
-                        logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在するため、リセットのみ行います。") # ログ維持
-                        task["status"] = "pending_download"
-                        task["download_progress"] = 0
-                        task["upload_progress"] = 0
-                        task["local_path"] = None
-                        task["error_message"] = "孤立ファイル削除によるリセット"
-                        task["last_updated"] = datetime.now().isoformat()
-                    logging.debug(f"タスク {fc2_id} のリセット処理完了。") # デバッグログ追加
+            reset_count = 0
+            for fc2_id in ids_to_reset:
+                task = self.task_status[fc2_id]
+                logging.info(f"失敗タスクをリセットします: {fc2_id} (現在の状態: {task.get('status')})") # ログ維持
+                # 状態を pending_download に戻し、進捗とエラーメッセージをリセット
+                task.update({
+                    "status": "pending_download",
+                    "download_progress": 0,
+                    "upload_progress": 0, # アップロード失敗の場合もダウンロードからやり直し
+                    "local_path": None, # ローカルファイルは削除される想定 (check_and_resume_downloads で処理)
+                    "error_message": None,
+                    "last_updated": datetime.now().isoformat()
+                })
+                # ダウンロードキューに存在しない場合のみ追加
+                if fc2_id not in self.download_queue:
+                    self.download_queue.appendleft(fc2_id) # 先頭に追加して優先的に処理
+                    logging.info(f"失敗タスク {fc2_id} をダウンロードキューに戻しました。") # ログ維持
+                    reset_count += 1
+                else:
+                    logging.debug(f"失敗タスク {fc2_id} は既にダウンロードキューに存在します。状態のみ更新。") # デバッグログ維持
 
-
-            if reset_count > 0 or failed_ids_in_processed: # processed_ids から削除があった場合も保存
-                logging.info(f"{reset_count} 件の失敗したタスクをリセットしました。") # ログ維持
-                await self._save_status()
-                logging.debug("失敗タスクリセット処理完了 - 状態を保存しました。") # デバッグログ追加
+            if reset_count > 0:
+                logging.info(f"失敗タスク {reset_count} 件をリセットし、ダウンロードキューに戻しました。") # ログ維持
+                await self._save_status() # 状態を保存
+                logging.debug("失敗タスクリセット処理完了。状態を保存しました。") # デバッグログ追加
             else:
-                logging.debug("失敗タスクリセット処理完了 - 対象タスクなし。") # デバッグログ追加
+                logging.info("リセット対象の失敗タスクはありませんでした。") # ログ維持
+                logging.debug("失敗タスクリセット処理完了 (対象なし)。") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
+
+    def _extract_fc2_id_from_filename(self, filename: str) -> Optional[str]:
+        """ファイル名からFC2 IDを抽出する"""
+        # download_module のファイル名生成ロジックに合わせた正規表現を使用
+        # 例: FC2-PPV-1234567_タイトル.mp4 のような形式を想定
+        match = re.search(r'FC2-PPV-(\d+)', filename)
+        if match:
+            return match.group(1)
+        return None
 
 
     async def check_and_resume_downloads(self, download_dir: str):
         """
-        ダウンロードディレクトリをチェックし、既存ファイルに基づいてタスクをレジュームまたはエラーとしてマークする。
-        部分的にダウンロードされたファイル (.part) や、対応するタスクがないファイルを処理する。
-        完了したファイル (.mp4) があればアップロードキューに追加する。
+        ダウンロードディレクトリをスキャンし、既存のダウンロード済みファイルや
+        中断された可能性のある部分ファイルをチェックして、必要に応じてタスクをレジュームまたはリセットする。
         """
         async with self._lock:
-            logging.info(f"ダウンロードディレクトリ '{download_dir}' をチェックし、既存ファイルに基づきタスク状態を更新します。") # ログ維持
-            logging.debug(f"check_and_resume_downloads 処理開始。ディレクトリ: {download_dir}") # デバッグログ追加
+            logging.info(f"ダウンロードディレクトリ '{download_dir}' のスキャンを開始します。") # ログ維持
+            logging.debug(f"スキャン開始時のtask_status: {json.dumps(self.task_status, indent=2)}") # デバッグログ維持
+            logging.debug(f"スキャン開始時のdownload_queue: {list(self.download_queue)}") # デバッグログ維持
+            logging.debug(f"スキャン開始時のupload_queue: {list(self.upload_queue)}") # デバッグログ維持
+
             if not os.path.isdir(download_dir):
-                logging.info(f"ダウンロードディレクトリ '{download_dir}' が存在しません。") # ログ維持
-                logging.debug("ダウンロードディレクトリチェック処理完了 (ディレクトリなし)。") # デバッグログ追加
+                logging.warning(f"ダウンロードディレクトリ '{download_dir}' が見つかりません。スキップします。") # ログ維持
+                logging.debug("ダウンロードディレクトリのスキャン処理完了 (ディレクトリなし)。") # デバッグログ追加
                 return
 
-            existing_files = [f for f in os.listdir(download_dir) if os.path.isfile(os.path.join(download_dir, f))]
-            logging.debug(f"ダウンロードディレクトリ内の既存ファイル: {existing_files}") # ログ維持
+            # ディレクトリ内のファイルとディレクトリをリストアップ
+            try:
+                entries = os.listdir(download_dir)
+                logging.debug(f"ディレクトリ '{download_dir}' の内容: {entries}") # デバッグログ追加
+            except OSError as e:
+                logging.error(f"ダウンロードディレクトリ '{download_dir}' の読み取りに失敗しました: {e}") # ログ維持
+                logging.debug("ダウンロードディレクトリのスキャン処理完了 (読み取りエラー)。") # デバッグログ追加
+                return
 
-            processed_files = set() # 処理済みのファイル名を記録
+            files_in_dir = [entry for entry in entries if os.path.isfile(os.path.join(download_dir, entry))]
+            logging.debug(f"ディレクトリ内のファイル: {files_in_dir}") # デバッグログ追加
 
-            # .part ファイルを優先的に処理 (中断されたダウンロード)
-            logging.debug(".part ファイルの処理を開始します。") # デバッグログ追加
-            for filename in existing_files:
-                if filename.endswith(".part"):
-                    logging.debug(f".part ファイル検出: {filename}") # デバッグログ追加
-                    original_filename = filename[:-5] # .part を取り除く
-                    # ファイル名からFC2 IDを推測 (例: "FC2-PPV-XXXXXXX Title.mp4.part")
-                    match = re.match(r"(FC2-PPV-\d+)", original_filename)
-                    if match:
-                        fc2_id = match.group(1)
-                        full_path = os.path.join(download_dir, filename)
-                        processed_files.add(filename)
-                        logging.debug(f"FC2 ID 抽出: {fc2_id} from {filename}") # デバッグログ追加
+            # 既存のダウンロード済みファイル (.mp4) をチェック
+            for filename in files_in_dir:
+                if filename.lower().endswith('.mp4'):
+                    file_path = os.path.join(download_dir, filename)
+                    logging.debug(f".mp4 ファイルを検出: {file_path}") # デバッグログ追加
+                    fc2_id = self._extract_fc2_id_from_filename(filename)
+                    if fc2_id:
+                        logging.debug(f"ファイル名 '{filename}' からFC2 ID '{fc2_id}' を抽出しました。") # デバッグログ追加
+                        # task_status に存在し、かつダウンロード完了/アップロード待ち/アップロード中/完了/スキップアップロードの状態でない場合
+                        # または task_status に存在しない場合
+                        task = self.task_status.get(fc2_id)
+                        logging.debug(f"タスク {fc2_id} の現在の状態: {task.get('status') if task else 'None'}") # デバッグログ追加
+                        if not task or task.get("status") not in ["completed", "pending_upload", "uploading", "skipped_upload"]:
+                             logging.info(f"既存のダウンロード済みファイル '{filename}' に対応するタスク {fc2_id} を検出。アップロードキューに追加します。") # ログ維持
+                             # タスクが task_status に存在しない場合は新しく作成
+                             if not task:
+                                  self.task_status[fc2_id] = {
+                                      "title": filename, # タイトルはファイル名から推測
+                                      "url": None, # 元のURLは不明
+                                      "added_date": datetime.now().isoformat(),
+                                      "rating": None,
+                                      "download_progress": 100.0,
+                                      "upload_progress": 0,
+                                      "error_message": None,
+                                  }
+                                  task = self.task_status[fc2_id] # 新しく作成したタスクを取得
+                                  logging.debug(f"タスク {fc2_id} を新しく作成しました。") # デバッグログ追加
 
-                        if fc2_id in self.task_status:
-                            task = self.task_status[fc2_id]
-                            logging.debug(f"タスク {fc2_id} がtask_statusに見つかりました。現在の状態: {task.get('status')}") # デバッグログ追加
-                            # 状態がダウンロード中、一時停止、エラーなどであればレジュームを試みる
-                            if task.get("status") in ["downloading", "paused", "error", "failed_download"]:
-                                logging.info(f"部分ファイル '{filename}' に基づきタスク {fc2_id} のレジュームを試みます。") # ログ維持
-                                logging.debug(f"タスク {fc2_id} はレジューム可能な状態です。pending_downloadに更新。") # デバッグログ追加
-                                # 状態を pending_download に戻し、キューの先頭に追加
-                                task["status"] = "pending_download"
-                                task["download_progress"] = 0 # 進捗をリセット (再開ロジックは download_video 側で実装される想定)
-                                task["upload_progress"] = 0
-                                task["local_path"] = full_path # 部分ファイルのパスを設定
-                                task["error_message"] = None
-                                task["last_updated"] = datetime.now().isoformat()
-                                if fc2_id not in self.download_queue:
-                                     self.download_queue.appendleft(fc2_id)
-                                     logging.info(f"タスク {fc2_id} をダウンロードキューの先頭に追加しました。") # ログ維持
-                                     logging.debug(f"タスク {fc2_id} をダウンロードキューに追加しました。") # デバッグログ追加
-                                else:
-                                     logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。") # ログ維持
-                                logging.debug(f"タスク {fc2_id} の状態をpending_downloadに更新しました。") # デバッグログ追加
-                            else:
-                                logging.warning(f"部分ファイル '{filename}' に対応するタスク {fc2_id} はレジューム不可能な状態 '{task.get('status')}' です。ファイルを削除します。") # ログ維持
-                                try:
-                                    os.remove(full_path)
-                                    logging.info(f"部分ファイル '{full_path}' を削除しました。") # ログ維持
-                                except OSError as e:
-                                    logging.error(f"部分ファイル '{full_path}' の削除に失敗しました: {e}") # ログ維持
-                                logging.debug(f"タスク {fc2_id} はレジューム不可。ファイル削除処理完了。") # デバッグログ追加
-                        else:
-                            logging.warning(f"部分ファイル '{filename}' に対応するタスク {fc2_id} が task_status に見つかりません。ファイルを削除します。") # ログ維持
-                            try:
-                                os.remove(full_path)
-                                logging.info(f"部分ファイル '{full_path}' を削除しました。") # ログ維持
-                            except OSError as e:
-                                logging.error(f"部分ファイル '{full_path}' の削除に失敗しました: {e}") # ログ維持
-                            logging.debug(f"タスク {fc2_id} 見つからず。ファイル削除処理完了。") # デバッグログ追加
-                    else:
-                        logging.warning(f"部分ファイル '{filename}' からFC2 IDを抽出できませんでした。ファイルを削除します。") # ログ維持
-                        try:
-                            os.remove(os.path.join(download_dir, filename))
-                            logging.info(f"部分ファイル '{os.path.join(download_dir, filename)}' を削除しました。") # ログ維持
-                        except OSError as e:
-                            logging.error(f"部分ファイル '{os.path.join(download_dir, filename)}' の削除に失敗しました: {e}") # ログ維持
-                        logging.debug(f"ファイル {filename} からID抽出失敗。ファイル削除処理完了。") # デバッグログ追加
-            logging.debug(".part ファイルの処理を完了しました。") # デバッグログ追加
+                             # タスクの状態を completed に設定し、ローカルパスとダウンロード進捗を更新
+                             task.update({
+                                 "status": "completed", # ダウンロード完了としてマーク
+                                 "download_progress": 100.0,
+                                 "local_path": file_path, # 既存のローカルパスを設定
+                                 "last_updated": datetime.now().isoformat()
+                             })
 
+                             # processed_ids に含まれている場合は削除 (再度処理させるため)
+                             if fc2_id in self.processed_ids:
+                                 self.processed_ids.remove(fc2_id)
+                                 logging.debug(f"タスク {fc2_id} をprocessed_idsから削除しました。") # デバッグログ追加
 
-            # .part 以外のファイルを処理 (完了したファイルまたは孤立したファイル)
-            logging.debug(".part 以外のファイルの処理を開始します。") # デバッグログ追加
-            for filename in existing_files:
-                 if filename not in processed_files: # .part ファイルは既に処理済み
-                    logging.debug(f".part 以外のファイル検出: {filename}") # デバッグログ追加
-                    # ファイル名からFC2 IDを推測
-                    match = re.match(r"(FC2-PPV-\d+)", filename)
-                    if match:
-                        fc2_id = match.group(1)
-                        full_path = os.path.join(download_dir, filename)
-                        logging.debug(f"FC2 ID 抽出: {fc2_id} from {filename}") # デバッグログ追加
-
-                        if fc2_id in self.task_status:
-                            task = self.task_status[fc2_id]
-                            logging.debug(f"タスク {fc2_id} がtask_statusに見つかりました。現在の状態: {task.get('status')}") # デバッグログ追加
-                            # .mp4 ファイルで、タスクが pending_download または downloading の場合 -> アップロードキューへ
-                            if filename.lower().endswith(".mp4") and task.get("status") in ["pending_download", "downloading"]:
-                                logging.info(f"完了ファイル '{filename}' に対応するタスク {fc2_id} をアップロードキューに追加します。") # ログ維持
-                                logging.debug(f"タスク {fc2_id} はpending_download/downloading状態の.mp4ファイルです。pending_uploadに更新。") # デバッグログ追加
-                                task["status"] = "pending_upload"
-                                task["download_progress"] = 100.0 # ダウンロードは完了
-                                task["upload_progress"] = 0
-                                task["local_path"] = full_path # ローカルパスを設定
-                                task["error_message"] = None
-                                task["last_updated"] = datetime.now().isoformat()
-                                if fc2_id not in self.upload_queue:
-                                     self.upload_queue.append(fc2_id) # アップロードキューの最後に追加
-                                     logging.info(f"タスク {fc2_id} をアップロードキューに追加しました。") # ログ維持
-                                     logging.debug(f"タスク {fc2_id} をアップロードキューに追加しました。") # デバッグログ追加
-                                else:
-                                     logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。") # ログ維持
-                                logging.debug(f"タスク {fc2_id} の状態をpending_uploadに更新しました。") # デバッグログ追加
-
-                            # pending_download のままファイルが存在するのはおかしいのでエラーとする (mp4 以外)
-                            elif task.get("status") == "pending_download":
-                                logging.warning(f"ファイル '{filename}' に対応するタスク {fc2_id} が pending_download 状態です。ファイルが不完全か孤立している可能性があります。ファイルを削除し、タスクをリセットします。") # ログ維持
-                                logging.debug(f"タスク {fc2_id} はpending_download状態の孤立ファイルです。リセット処理開始。") # デバッグログ追加
-                                try:
-                                    os.remove(full_path)
-                                    logging.info(f"ファイル '{full_path}' を削除しました。") # ログ維持
-                                except OSError as e:
-                                    logging.error(f"ファイル '{full_path}' の削除に失敗しました: {e}") # ログ維持
-                                # タスクをリセットしてダウンロードキューに戻す
-                                if fc2_id not in self.download_queue:
-                                     task["status"] = "pending_download"
-                                     task["download_progress"] = 0
-                                     task["upload_progress"] = 0
-                                     task["local_path"] = None
-                                     task["error_message"] = "孤立ファイル削除によるリセット"
-                                     task["last_updated"] = datetime.now().isoformat()
-                                     self.download_queue.appendleft(fc2_id)
-                                     logging.info(f"タスク {fc2_id} をダウンロードキューに追加しました。") # ログ維持
-                                     logging.debug(f"タスク {fc2_id} をダウンロードキューに追加しました。") # デバッグログ追加
-                                else:
-                                     logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。リセットのみ行います。") # デバッグログ追加
-                                     task["status"] = "pending_download"
-                                     task["download_progress"] = 0
-                                     task["upload_progress"] = 0
-                                     task["local_path"] = None
-                                     task["error_message"] = "孤立ファイル削除によるリセット"
-                                     task["last_updated"] = datetime.now().isoformat()
-                                logging.debug(f"タスク {fc2_id} の状態をpending_downloadにリセットしました。") # デバッグログ追加
-
-                            else:
-                                logging.debug(f"ファイル '{filename}' に対応するタスク {fc2_id} は他の状態 ({task.get('status')}) です。処理スキップ。") # デバッグログ追加
+                             # アップロードキューに存在しない場合のみ追加
+                             if fc2_id not in self.upload_queue:
+                                 self.upload_queue.append(fc2_id)
+                                 logging.info(f"アップロードキューに追加: {fc2_id} - {filename}") # ログ維持
+                                 logging.debug(f"タスク {fc2_id} をアップロードキューに追加しました。") # デバッグログ追加
+                             else:
+                                 logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。") # デバッグログ維持
 
                         else:
-                            logging.warning(f"ファイル '{filename}' に対応するタスク {fc2_id} が task_status に見つかりません。ファイルを削除します。") # ログ維持
-                            try:
-                                os.remove(full_path)
-                                logging.info(f"ファイル '{full_path}' を削除しました。") # ログ維持
-                            except OSError as e:
-                                logging.error(f"ファイル '{full_path}' の削除に失敗しました: {e}") # ログ維持
-                            logging.debug(f"タスク {fc2_id} 見つからず。ファイル削除処理完了。") # デバッグログ追加
+                             logging.debug(f"ファイル '{filename}' に対応するタスク {fc2_id} は既に処理済みまたは処理中です (状態: {task.get('status')})。スキップ。") # デバッグログ追加
                     else:
-                        logging.warning(f"ファイル '{filename}' からFC2 IDを抽出できませんでした。ファイルを削除します。") # ログ維持
-                        try:
-                            os.remove(os.path.join(download_dir, filename))
-                            logging.info(f"ファイル '{os.path.join(download_dir, filename)}' を削除しました。") # ログ維持
-                        except OSError as e:
-                            logging.error(f"ファイル '{os.path.join(download_dir, filename)}' の削除に失敗しました: {e}") # ログ維持
-                        logging.debug(f"ファイル {filename} からID抽出失敗。ファイル削除処理完了。") # デバッグログ追加
-            logging.debug(".part 以外のファイルの処理を完了しました。") # デバッグログ追加
+                        logging.warning(f"ファイル名 '{filename}' からFC2 IDを抽出できませんでした。スキップします。") # ログ維持
+                        logging.debug(f"ファイル '{filename}' のFC2 ID抽出に失敗しました。") # デバッグログ追加
 
-            # check_and_resume_downloads 処理完了後に状態を保存
-            await self._save_status()
-            logging.info("ダウンロードディレクトリのチェックとタスク状態の更新を完了しました。") # ログ追加
-            logging.debug("check_and_resume_downloads 処理完了。") # デバッグログ追加
+            # 部分ファイル (.part) をチェック (yt-dlp の一時ファイル)
+            for filename in files_in_dir:
+                if filename.lower().endswith('.part'):
+                    file_path = os.path.join(download_dir, filename)
+                    logging.debug(f".part ファイルを検出: {file_path}") # デバッグログ追加
+                    # .part ファイル名から元のファイル名を推測し、そこからFC2 IDを抽出
+                    # 例: タイトル.mp4.part -> タイトル.mp4 -> FC2-PPV-1234567
+                    original_filename = filename[:-5] # '.part' を削除
+                    fc2_id = self._extract_fc2_id_from_filename(original_filename)
+
+                    if fc2_id:
+                        logging.debug(f"部分ファイル '{filename}' からFC2 ID '{fc2_id}' を抽出しました。") # デバッグログ追加
+                        task = self.task_status.get(fc2_id)
+                        logging.debug(f"タスク {fc2_id} の現在の状態: {task.get('status') if task else 'None'}") # デバッグログ追加
+
+                        # task_status に存在し、かつ downloading または paused 状態の場合にレジューム可能と判断
+                        if task and task.get("status") in ["downloading", "paused"]:
+                            logging.info(f"中断されたダウンロードファイル '{filename}' に対応するタスク {fc2_id} を検出。ダウンロードをレジュームします。") # ログ維持
+                            # 状態を pending_download に戻し、ダウンロードキューの先頭に追加
+                            task["status"] = "pending_download"
+                            task["last_updated"] = datetime.now().isoformat()
+                            # local_path は .part ファイルのパスを設定 (yt-dlp が認識するため)
+                            task["local_path"] = file_path # .part ファイルのパスを設定
+                            if fc2_id not in self.download_queue:
+                                self.download_queue.appendleft(fc2_id) # 先頭に追加して優先的に処理
+                                logging.info(f"中断されたダウンロードタスク {fc2_id} をダウンロードキューに戻しました。") # ログ維持
+                                logging.debug(f"タスク {fc2_id} をダウンロードキューに追加しました。") # デバッグログ追加
+                            else:
+                                logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。状態のみ更新。") # デバッグログ維持
+
+                        else:
+                            # レジューム不可能な状態、または task_status に存在しない場合はファイルを削除
+                            logging.warning(f"部分ファイル '{filename}' に対応するタスク {fc2_id} はレジューム不可能な状態 '{task.get('status') if task else 'None'}' です、またはタスクが見つかりません。ファイルを削除します。") # ログ維持
+                            try:
+                                os.remove(file_path)
+                                logging.info(f"部分ファイル '{file_path}' を削除しました。") # ログ維持
+                                logging.debug(f"部分ファイル '{file_path}' の削除に成功しました。") # デバッグログ追加
+                            except OSError as e:
+                                logging.error(f"部分ファイル '{file_path}' の削除に失敗しました: {e}") # ログ維持
+                                logging.debug(f"部分ファイル '{file_path}' の削除に失敗しました: {e}") # デバッグログ追加
+
+                    else:
+                        # FC2 ID が抽出できない .part ファイルは孤立している可能性が高いので削除
+                        logging.warning(f"部分ファイル '{filename}' からFC2 IDを抽出できませんでした。孤立ファイルとして削除します。") # ログ維持
+                        try:
+                            os.remove(file_path)
+                            logging.info(f"孤立した部分ファイル '{file_path}' を削除しました。") # ログ維持
+                            logging.debug(f"孤立した部分ファイル '{file_path}' の削除に成功しました。") # デバッグログ追加
+                        except OSError as e:
+                            logging.error(f"孤立した部分ファイル '{file_path}' の削除に失敗しました: {e}") # ログ維持
+                            logging.debug(f"孤立した部分ファイル '{file_path}' の削除に失敗しました: {e}") # デバッグログ追加
+
+            # task_status にあるが、downloads フォルダにファイルが存在しないタスクをチェック
+            # これは、ファイルが手動で削除されたか、ダウンロードが開始される前に中断された場合などに発生する
+            ids_to_check = list(self.task_status.keys()) # イテレーション中の変更を避ける
+            for fc2_id in ids_to_check:
+                 task = self.task_status.get(fc2_id)
+                 if task and task.get("status") in ["pending_download", "downloading", "pending_upload", "uploading", "paused"]:
+                      local_path = task.get("local_path")
+                      # local_path が設定されている場合のみファイル存在チェック
+                      if local_path and os.path.exists(local_path):
+                           logging.debug(f"タスク {fc2_id}: local_path '{local_path}' が存在します。") # デバッグログ追加
+                           pass # ファイルが存在するので問題なし
+                      else:
+                           # ファイルが存在しない場合、タスクの状態に応じて処理
+                           logging.warning(f"タスク {fc2_id} に対応するファイル '{local_path}' が見つかりません。状態: {task.get('status')}") # ログ維持
+                           if task.get("status") in ["pending_download", "downloading", "paused"]:
+                                # ダウンロード関連の状態の場合、タスクをリセットしてダウンロードキューに戻す
+                                logging.info(f"タスク {fc2_id} (状態: {task.get('status')}) に対応するファイルが見つからないため、タスクをリセットしてダウンロードキューに戻します。") # ログ維持
+                                task.update({
+                                    "status": "pending_download",
+                                    "download_progress": 0,
+                                    "upload_progress": 0,
+                                    "local_path": None, # ローカルパスをリセット
+                                    "error_message": "ファイルが見つからないためリセット",
+                                    "last_updated": datetime.now().isoformat()
+                                })
+                                if fc2_id not in self.download_queue:
+                                     self.download_queue.appendleft(fc2_id) # 先頭に追加
+                                     logging.debug(f"タスク {fc2_id} をダウンロードキューに追加しました。") # デバッグログ追加
+                                else:
+                                     logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。状態のみ更新。") # デバッグログ維持
+                           elif task.get("status") in ["pending_upload", "uploading"]:
+                                # アップロード関連の状態の場合、エラーとしてマーク
+                                logging.error(f"タスク {fc2_id} (状態: {task.get('status')}) に対応するファイルが見つからないため、エラーとしてマークします。") # ログ維持
+                                task.update({
+                                    "status": "error",
+                                    "error_message": "アップロード対象ファイルが見つかりません",
+                                    "last_updated": datetime.now().isoformat()
+                                })
+                                # アップロードキューから削除 (もしあれば)
+                                if fc2_id in self.upload_queue:
+                                     self.upload_queue.remove(fc2_id)
+                                     logging.debug(f"タスク {fc2_id} をアップロードキューから削除しました。") # デバッグログ追加
+                                # processed_ids には追加しない (リセット可能にするため)
+                                logging.debug(f"タスク {fc2_id} をprocessed_idsに追加しません。") # デバッグログ追加
+
+
+            logging.info(f"ダウンロードディレクトリ '{download_dir}' のスキャンが完了しました。") # ログ維持
+            logging.debug(f"スキャン完了時のtask_status: {json.dumps(self.task_status, indent=2)}") # デバッグログ維持
+            logging.debug(f"スキャン完了時のdownload_queue: {list(self.download_queue)}") # デバッグログ維持
+            logging.debug(f"スキャン完了時のupload_queue: {list(self.upload_queue)}") # デバッグログ維持
+            await self._save_status() # 状態を保存
+            logging.debug("ダウンロードディレクトリのスキャン処理完了。状態を保存しました。") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
 
 
@@ -750,34 +778,66 @@ class StatusManager:
             task = self.task_status.get(fc2_id)
             if task and task.get("local_path"):
                 local_path = task["local_path"]
+                logging.debug(f"削除対象ファイル: {local_path}") # デバッグログ追加
                 if os.path.exists(local_path):
                     try:
                         os.remove(local_path)
-                        logging.info(f"ローカルファイルを削除しました: {local_path}") # ログ維持
-                        # 状態からローカルパスを削除
-                        task["local_path"] = None
+                        logging.info(f"ローカルファイル '{local_path}' を削除しました。") # ログ維持
+                        # task_status から local_path を削除
+                        del task["local_path"]
                         task["last_updated"] = datetime.now().isoformat()
                         await self._save_status()
-                        logging.debug(f"ローカルファイル {local_path} を削除し、状態を保存しました。") # デバッグログ追加
+                        logging.debug(f"ローカルファイル削除処理完了: {fc2_id} - ファイル削除成功、状態保存。") # デバッグログ追加
                     except OSError as e:
-                        logging.error(f"ローカルファイルの削除に失敗しました: {local_path} - {e}") # ログ維持
+                        logging.error(f"ローカルファイル '{local_path}' の削除に失敗しました: {e}") # ログ維持
+                        # エラーメッセージを更新
                         task["error_message"] = f"ファイル削除失敗: {e}"
                         task["last_updated"] = datetime.now().isoformat()
                         await self._save_status()
-                        logging.debug(f"ローカルファイル {local_path} の削除に失敗し、状態を保存しました。") # デバッグログ追加
+                        logging.debug(f"ローカルファイル削除処理完了: {fc2_id} - ファイル削除失敗、状態保存。") # デバッグログ追加
                 else:
-                    logging.warning(f"削除対象のローカルファイルが見つかりません: {local_path}") # ログ維持
-                    # ファイルがない場合でも状態からパスを削除するか？
-                    task["local_path"] = None
+                    logging.warning(f"削除対象のローカルファイル '{local_path}' が見つかりません: {fc2_id}") # ログ維持
+                    # ファイルが見つからない場合も task_status から local_path を削除
+                    del task["local_path"]
                     task["last_updated"] = datetime.now().isoformat()
                     await self._save_status()
-                    logging.debug(f"削除対象ファイル {local_path} が見つかりませんでしたが、状態からパスを削除しました。") # デバッグログ追加
+                    logging.debug(f"ローカルファイル削除処理完了: {fc2_id} - ファイル見つからず、状態保存。") # デバッグログ追加
             else:
-                logging.warning(f"ローカルファイル削除対象のタスクが見つからないか、ローカルパスが設定されていません: {fc2_id}") # ログ維持
-                logging.debug(f"ローカルファイル削除処理完了: {fc2_id} - 対象なし。") # デバッグログ追加
+                logging.warning(f"ローカルファイル削除対象のタスクが見つからないか、local_pathが設定されていません: {fc2_id}") # ログ維持
+                logging.debug(f"ローカルファイル削除対象のタスクが見つからないか、local_pathが設定されていません: {fc2_id}") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
+
 
     async def wait_for_status_update(self):
         """状態が更新されるまで待機する"""
+        logging.debug("状態更新イベントを待機します。") # デバッグログ追加
+        await self._status_updated_event.wait()
         self._status_updated_event.clear() # イベントをクリア
-        await self._status_updated_event.wait() # イベントがセットされるまで待機
+        logging.debug("状態更新イベントを検出しました。") # デバッグログ追加
+
+    async def are_all_uploads_completed(self) -> bool:
+        """すべてのアップロードタスクが完了したかチェックする"""
+        async with self._lock:
+            logging.debug("すべてのアップロード完了チェック処理開始。") # デバッグログ追加
+            # アップロードキューが空であり、かつアップロード中のタスクがないことを確認
+            # task_status を見て、status が 'uploading' のタスクがないかチェック
+            uploading_tasks = [
+                fc2_id for fc2_id, task in self.task_status.items()
+                if task.get("status") == "uploading"
+            ]
+            is_completed = not self.upload_queue and not uploading_tasks
+            logging.debug(f"アップロードキューの数: {len(self.upload_queue)}, アップロード中のタスク数: {len(uploading_tasks)}") # デバッグログ追加
+            logging.debug(f"すべてのアップロード完了チェック結果: {is_completed}") # デバッグログ追加
+            return is_completed
+
+    async def wait_for_all_uploads_completion(self):
+        """すべてのアップロードタスクが完了するまで待機する"""
+        logging.info("すべてのアップロードタスクの完了を待機します。") # ログ追加
+        while True:
+            if await self.are_all_uploads_completed():
+                logging.info("すべてのアップロードタスクが完了しました。") # ログ追加
+                break
+            logging.debug("アップロードタスク完了待ち: アップロード中のタスクまたはキューにタスクがあります。") # デバッグログ追加
+            await self.wait_for_status_update() # 状態が更新されるまで待機
+            # 短時間スリープしてポーリング間隔を調整 (任意)
+            await asyncio.sleep(1)
