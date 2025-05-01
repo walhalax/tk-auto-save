@@ -11,12 +11,13 @@ from fastapi.templating import Jinja2Templates # HTMLテンプレート用
 from contextlib import asynccontextmanager # lifespan用 (FastAPI 0.90.0+)
 from datetime import datetime, timedelta # 巡回期間制限用
 import re # タスク名からIDを抽出するために追加
+import httpx # httpx を再度インポート
 
-# 作成したモジュールをインポート
-from .status_manager import StatusManager
-from .content_scraper import scrape_eligible_videos
-from .download_module import download_video_from_page
-from .upload_module import upload_to_server
+# 作成したモジュールをインポート (src. プレフィックスを付けて絶対インポート)
+from src.status_manager import StatusManager
+from src.content_scraper import TARGET_URL, REQUIRED_DAYS_PASSED, scrape_eligible_videos
+from src.download_module import download_video_from_page
+from src.upload_module import upload_to_server # upload_to_server を追加
 
 # ロギング設定 (DEBUG レベルで詳細を確認)
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s')
@@ -91,6 +92,9 @@ else:
 
 async def download_worker(fc2_id: str, task_info: dict):
     """ダウンロードタスクを実行するワーカー"""
+    # download_module を関数内でインポート (不要になったため削除)
+    # from download_module import download_video_from_page # 関数内でインポート
+
     async with download_semaphore:
         if stop_requested_flag:
             logging.info(f"停止リクエスト検出のため、ダウンロードをスキップ: {fc2_id}")
@@ -151,6 +155,9 @@ async def download_worker(fc2_id: str, task_info: dict):
 
 async def upload_worker(fc2_id: str, task_info: dict):
     """アップロードタスクを実行するワーカー"""
+    # upload_module を関数内でインポート (不要になったため削除)
+    # from upload_module import upload_to_server # 関数内でインポート
+
     async with upload_semaphore:
         if stop_requested_flag:
             logging.info(f"停止リクエスト検出のため、アップロードをスキップ: {fc2_id}")
@@ -200,7 +207,7 @@ async def main_background_loop():
     global background_tasks_running, stop_requested_flag
     logging.info("メインバックグラウンドループを開始します。")
     logging.debug(f"main_background_loop 開始時のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
-    logging.debug(f"main_background_loop 開始時のbackground_tasks_running: {background_tasks_running}") # デバッグログ追加
+    logging.debug(f"main_background_loop 開始時のbackground_tasks_running: {background_tasks_running}") # デバッグログ維持
     background_tasks_running = True
     stop_requested_flag = False # 開始時にフラグをクリア
 
@@ -212,7 +219,7 @@ async def main_background_loop():
         # 1. スクレイピング実行
         logging.info("スクレイピングを開始します...")
         processed_ids = await status_manager.get_processed_ids()
-        from .content_scraper import TARGET_URL, REQUIRED_DAYS_PASSED
+        # content_scraper から必要なものをインポート済み
         one_month_ago = datetime.now() - timedelta(days=30)
         eligible_videos = await scrape_eligible_videos(
             TARGET_URL,
@@ -255,12 +262,12 @@ async def main_background_loop():
         active_workers: List[asyncio.Task] = []
         logging.info("--- ワーカー実行ループ開始 ---")
         logging.debug(f"main_background_loop 開始時のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
-        logging.debug(f"main_background_loop 開始時のbackground_tasks_running: {background_tasks_running}") # デバッグログ追加
+        logging.debug(f"main_background_loop 開始時のbackground_tasks_running: {background_tasks_running}") # デバッグログ維持
         loop_count = 0
         while True:
             loop_count += 1
             logging.debug(f"--- ワーカー実行ループ {loop_count} 回目開始 ---") # デバッグログ追加
-            logging.debug(f"ループ開始時のstop_requested_flag: {stop_requested_flag}") # デバッグログ追加
+            logging.debug(f"ループ開始時のstop_requested_flag: {stop_requested_flag}") # デバッグログ維持
 
             if stop_requested_flag:
                 logging.info("ワーカー実行ループで停止リクエストを検出。")
@@ -279,7 +286,7 @@ async def main_background_loop():
                     fc2_id, next_ul_task_info = next_ul_task_result
                     logging.info(f"アップロードタスク取得成功: {fc2_id}")
                     logging.debug(f"取得したタスク情報: {next_ul_task_info}")
-                    if not next_ul_task_info or not isinstance(next_ul_task_info, dict):
+                    if not next_ul_task_result or not isinstance(next_ul_task_info, dict):
                          logging.error(f"取得したアップロードタスク情報が無効です: {fc2_id}, Info: {next_ul_task_info}")
                          continue
                     
@@ -305,12 +312,11 @@ async def main_background_loop():
                     logging.debug(f"次のDLタスク取得試行前 - キュー内容 ({len(current_dl_queue_ids)}件): {list(current_dl_queue_ids)}") # デバッグログ追加
 
                 next_dl_task_result = await status_manager.get_next_download_task()
-
                 if next_dl_task_result:
                     fc2_id, next_dl_task_info = next_dl_task_result
                     logging.info(f"ダウンロードタスク取得成功: {fc2_id}")
                     logging.debug(f"取得したタスク情報: {next_dl_task_info}")
-                    if not next_dl_task_info or not isinstance(next_dl_task_info, dict):
+                    if not next_dl_task_result or not isinstance(next_dl_task_info, dict):
                          logging.error(f"取得したタスク情報が無効です: {fc2_id}, Info: {next_dl_task_info}")
                          continue # 次のループへ
 
@@ -431,6 +437,11 @@ async def read_root(request: Request):
 async def status_stream(request: Request):
     """現在の処理状況をSSEでストリーム配信する"""
     async def event_generator():
+        # 接続確立時に最新の状態を一度送信
+        initial_status = await status_manager.get_all_status()
+        yield f"data: {json.dumps(initial_status)}\n\n"
+        logging.debug("SSE 初期ステータスを送信しました。") # デバッグログ追加
+
         while True:
             # クライアントが切断されたかチェック
             if await request.is_disconnected():
@@ -439,9 +450,11 @@ async def status_stream(request: Request):
 
             # StatusManager の状態更新を待機
             await status_manager.wait_for_status_update()
+            logging.debug("SSE 状態更新イベントを検出しました。") # デバッグログ追加
 
             # 最新のステータスを取得
             current_status = await status_manager.get_all_status()
+            logging.debug(f"SSE ステータス更新データを送信: {current_status}") # デバッグログ追加
 
             # データをSSEフォーマットで送信
             yield f"data: {json.dumps(current_status)}\n\n"
@@ -498,29 +511,36 @@ async def stop_processing():
     if main_task_handle and not main_task_handle.done():
         logging.info("メインバックグラウンドタスクのキャンセルを試みます。")
         main_task_handle.cancel()
-        # キャンセルが完了するまで待つ必要はない（シャットダウン時に待機するため）
-
-    return JSONResponse(content={"message": "処理の中断をリクエストしました。完了まで時間がかかる場合があります。"})
-
 
 @app.post("/resume")
 async def resume_processing(background_tasks: BackgroundTasks):
-    """中断された処理を再開する"""
-    global background_tasks_running, main_task_handle
+    """中断されたタスクの処理を再開する"""
+    global background_tasks_running, stop_requested_flag, main_task_handle
     if background_tasks_running:
         raise HTTPException(status_code=400, detail="処理は既に実行中です。")
 
-    logging.info("処理の再開リクエストを受け付けました。")
-    stop_requested_flag = False
-    await status_manager.clear_stop_request()
-    await status_manager.resume_paused_tasks()
-    main_task_handle = asyncio.create_task(main_background_loop(), name="main_loop_resume")
-    return JSONResponse(content={"message": "処理を再開しました。"})
+    logging.info("中断されたタスクの再開リクエストを受け付けました。")
+    stop_requested_flag = False # 停止フラグをクリア
+    await status_manager.clear_stop_request() # StatusManager内の停止フラグもクリア
 
+    # 中断されたタスクを適切なキューに戻す
+    await status_manager.resume_paused_tasks()
+
+    # ダウンロードディレクトリを再度チェックし、状態を更新 (念のため)
+    await status_manager.check_and_resume_downloads("downloads")
+
+    main_task_handle = asyncio.create_task(main_background_loop(), name="main_loop")
+    return JSONResponse(content={"message": "中断されたタスクの処理を再開しました。"})
 
 @app.post("/reset_failed")
 async def reset_failed():
-     """失敗したタスクをリセットする"""
-     logging.info("失敗したタスクのリセットリクエストを受け付けました。")
-     await status_manager.reset_failed_tasks()
-     return JSONResponse(content={"message": "失敗したタスクをリセットしました。"}) # 成功時のレスポンスを追加
+    """失敗したタスクをリセットしてダウンロードキューに戻す"""
+    logging.info("失敗したタスクのリセットリクエストを受け付けました。")
+    await status_manager.reset_failed_tasks()
+    return JSONResponse(content={"message": "失敗したタスクをリセットしました。"})
+
+# 静的ファイル配信の設定 (templates ディレクトリを静的ファイルとして配信)
+# Jinja2Templates と StaticFiles の両方を使用する場合、パスの競合に注意
+# ここではテンプレートファイルのみを Jinja2 で扱い、それ以外の静的ファイルは StaticFiles で配信
+# 例: CSS, JS ファイルなどを static ディレクトリに置く場合
+# app.mount("/static", StaticFiles(directory="static"), name="static")

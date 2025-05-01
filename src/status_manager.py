@@ -234,7 +234,7 @@ class StatusManager:
                              self.upload_queue.append(fc2_id)
                              logging.info(f"アップロードキューに追加: {fc2_id} - {title}") # ログ維持
                          else:
-                             logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。") # デバッグログ維持
+                             logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。スキップ。") # デバッグログ維持
 
                          await self._save_status() # 状態を保存
                          logging.debug(f"タスク {fc2_id} をダウンロード完了としてマークし、アップロードキューに追加しました。状態を保存。") # デバッグログ追加
@@ -280,7 +280,6 @@ class StatusManager:
                 logging.debug(f"タスク {fc2_id} は既にダウンロード待ちまたはダウンロード中です。スキップ。") # デバッグログ維持
             logging.debug(f"ダウンロードタスク追加処理完了: {fc2_id}") # デバッグログ追加
         self._status_updated_event.set() # 状態変更時にイベントをセット
-
 
     async def get_next_download_task(self) -> Optional[Tuple[str, Dict[str, Any]]]:
         """ダウンロードキューから次のタスクを取得し、状態を 'downloading' に更新する"""
@@ -351,19 +350,23 @@ class StatusManager:
                               current_task["status"] = "error"
                               current_task["error_message"] = "ダウンロード完了後ローカルパス不明"
                     logging.debug(f"ダウンロード完了処理: {fc2_id} - アップロードキュー追加チェック完了。") # デバッグログ追加
-                elif new_status == "error" or new_status == "failed_download":
-                    logging.error(f"ダウンロード失敗/エラー: {fc2_id} - {progress_data.get('message')}") # ログ維持
+                elif new_status in ["error", "failed_download", "paused"]: # error, failed_download, paused の場合は local_path を None にしない
+                    logging.error(f"ダウンロード失敗/エラー/中断: {fc2_id} - {progress_data.get('message')}") # ログ維持
                     # processed_ids には追加しない (リセット可能にするため)
-                    logging.debug(f"ダウンロード失敗処理: {fc2_id} - processed_idsに追加しません。") # デバッグログ追加
+                    # local_path はそのまま保持
+                    current_task["status"] = new_status # ステータスのみ更新
+                    current_task["error_message"] = progress_data.get('message') # エラーメッセージを更新
+                    current_task["last_updated"] = datetime.now().isoformat()
+                    logging.debug(f"ダウンロード失敗/エラー/中断処理: {fc2_id} - processed_idsに追加しません。local_pathは保持。") # デバッグログ追加
                 elif new_status == "skipped":
                      logging.info(f"ダウンロードスキップ: {fc2_id} - {progress_data.get('message')}") # ログ維持
                      self.processed_ids.add(fc2_id) # スキップは処理済みとする
                      # task_status から削除するかどうか？ 일단残す
+                     current_task["status"] = "skipped_download" # スキップ状態を明確に
+                     current_task["error_message"] = progress_data.get('message') # スキップ理由を保存
+                     current_task["last_updated"] = datetime.now().isoformat()
+                     # local_path はスキップ理由によるが、ここでは None にしないでおく
                      logging.debug(f"ダウンロードスキップ処理: {fc2_id} - processed_idsに追加しました。") # デバッグログ追加
-                elif new_status == "paused": # paused 状態の更新を追加
-                     logging.info(f"ダウンロード中断: {fc2_id} - {progress_data.get('message')}") # ログ追加
-                     current_task["status"] = "paused"
-                     logging.debug(f"ダウンロード中断処理: {fc2_id} - 状態をpausedに更新しました。") # デバッグログ追加
 
 
                 await self._save_status() # 状態を保存
@@ -450,14 +453,13 @@ class StatusManager:
                     self.processed_ids.add(fc2_id) # 処理済みに追加
                     current_task["status"] = "completed" if new_status == "finished" else "skipped_upload"
                     logging.debug(f"アップロード完了/スキップ処理: {fc2_id} - processed_idsに追加しました。") # デバッグログ追加
-                elif new_status == "error" or new_status == "failed_upload":
-                    logging.error(f"アップロード失敗/エラー: {fc2_id} - {progress_data.get('message')}") # ログ維持
+                elif new_status in ["error", "failed_upload", "paused"]: # error, failed_upload, paused の場合は processed_ids に追加しない
+                    logging.error(f"アップロード失敗/エラー/中断: {fc2_id} - {progress_data.get('message')}") # ログ維持
                     # processed_ids には追加しない
-                    logging.debug(f"アップロード失敗処理: {fc2_id} - processed_idsに追加しません。") # デバッグログ追加
-                elif new_status == "paused": # paused 状態の更新を追加
-                     logging.info(f"アップロード中断: {fc2_id} - {progress_data.get('message')}") # ログ追加
-                     current_task["status"] = "paused"
-                     logging.debug(f"アップロード中断処理: {fc2_id} - 状態をpausedに更新しました。") # デバッグログ追加
+                    current_task["status"] = new_status # ステータスのみ更新
+                    current_task["error_message"] = progress_data.get('message') # エラーメッセージを更新
+                    current_task["last_updated"] = datetime.now().isoformat()
+                    logging.debug(f"アップロード失敗/エラー/中断処理: {fc2_id} - processed_idsに追加しません。") # デバッグログ追加
 
 
                 await self._save_status() # 状態を保存
@@ -625,7 +627,7 @@ class StatusManager:
                     "download_progress": 0,
                     "upload_progress": 0, # アップロード失敗の場合もダウンロードからやり直し
                     "local_path": None, # ローカルファイルは削除される想定 (check_and_resume_downloads で処理)
-                    "error_message": None,
+                    "error_message": "ファイルが見つからないためリセット",
                     "last_updated": datetime.now().isoformat()
                 })
                 # ダウンロードキューに存在しない場合のみ追加
