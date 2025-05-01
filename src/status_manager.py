@@ -110,34 +110,107 @@ class StatusManager:
         async with self._lock:
             logging.debug(f"ダウンロードタスク追加処理開始: {fc2_id}") # デバッグログ追加
 
-            # ローカルファイルが既に存在するかチェック
             # ファイル名を推測 (download_module のロジックに合わせる)
             title = video_info.get('title', fc2_id)
             safe_filename = "".join(c if c.isalnum() or c in (' ', '.', '_', '-') else '_' for c in title)
             if not safe_filename.lower().endswith('.mp4'):
                  safe_filename += '.mp4'
-            local_path = os.path.join("downloads", safe_filename)
 
-            # ファイルが存在し、かつサイズが0より大きい場合
-            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            # アップロード先のフォルダパスを生成 (FC2 IDの左から3桁を抜き出し、末尾を0にするルール)
+            # FC2-PPV-XXX の XXX 部分を抜き出し、末尾を0にする
+            match = re.search(r'FC2-PPV-(\d+)', fc2_id)
+            upload_folder_name = None
+            if match:
+                numeric_id = match.group(1)
+                if len(numeric_id) >= 3:
+                    upload_folder_suffix = numeric_id[:3] # 左から3桁を抜き出し
+                    # 抜き出した3桁の末尾を0にする
+                    if len(upload_folder_suffix) > 0:
+                         upload_folder_suffix = upload_folder_suffix[:-1] + '0'
+                    else:
+                         upload_folder_suffix = '0' # 3桁未満の場合の考慮（念のため）
+
+                    upload_folder_name = f"FC2-PPV-{upload_folder_suffix}"
+                elif len(numeric_id) > 0:
+                     # 3桁未満だが数字がある場合、その数字の末尾を0にする
+                     upload_folder_suffix = numeric_id[:-1] + '0'
+                     upload_folder_name = f"FC2-PPV-{upload_folder_suffix}"
+                else:
+                    # 数字部分がない場合はデフォルトのフォルダ名など考慮が必要かもしれません
+                    upload_folder_name = "FC2-PPV-0"
+            else:
+                 # FC2-PPV-XXX 形式でない場合は、FC2 ID そのものを使用し末尾を0にする（前回のロジックを維持）
+                 if len(fc2_id) > 0:
+                      upload_folder_suffix = fc2_id[:-1] + '0'
+                      upload_folder_name = f"FC2-PPV-{upload_folder_suffix}"
+                 else:
+                      upload_folder_name = "FC2-PPV-0"
+
+
+            upload_dir = os.path.join("uploads", upload_folder_name)
+            upload_path = os.path.join(upload_dir, safe_filename)
+
+            # アップロード先に同名のファイルが既に存在し、かつサイズが0より大きいかチェック (容量100%とみなす)
+            if os.path.exists(upload_path) and os.path.getsize(upload_path) > 0:
+                logging.info(f"アップロード先に既存の完全なファイル '{upload_path}' を検出。ダウンロードをスキップし、ダウンロード完了としてマーク、アップロードキューに追加します。") # ログ維持
+
+                # タスクが task_status に存在しない場合は新しく作成
+                if fc2_id not in self.task_status:
+                     self.task_status[fc2_id] = {
+                         "title": title,
+                         "url": video_info.get('url'), # 元のURLは保持
+                         "added_date": video_info.get('added_date_str'),
+                         "rating": video_info.get('rating'),
+                         "upload_progress": 0,
+                         "error_message": None,
+                     }
+
+                # タスクの状態を completed に設定し、ローカルパスとダウンロード進捗を更新
+                self.task_status[fc2_id].update({
+                    "status": "completed", # ダウンロード完了としてマーク
+                    "download_progress": 100.0,
+                    "local_path": upload_path, # アップロード先のパスを設定
+                    "last_updated": datetime.now().isoformat()
+                })
+
+                # processed_ids に含まれている場合は削除 (再度処理させるため)
+                if fc2_id in self.processed_ids:
+                    self.processed_ids.remove(fc2_id)
+                    logging.debug(f"タスク {fc2_id} をprocessed_idsから削除しました。") # デバッグログ追加
+
+                # アップロードキューに存在しない場合のみ追加
+                if fc2_id not in self.upload_queue:
+                    self.upload_queue.append(fc2_id)
+                    logging.info(f"アップロードキューに追加: {fc2_id} - {title}") # ログ維持
+                else:
+                    logging.debug(f"タスク {fc2_id} は既にアップロードキューに存在します。") # デバッグログ維持
+
+                await self._save_status() # 状態を保存
+                logging.debug(f"タスク {fc2_id} をダウンロード完了としてマークし、アップロードキューに追加しました。状態を保存。") # デバッグログ追加
+                self._status_updated_event.set() # 状態変更時にイベントをセット
+                return # 処理終了
+
+            # アップロード先に完全なファイルがない場合、ローカルのdownloadsフォルダに既存ファイルがあるかチェック
+            local_downloads_path = os.path.join("downloads", safe_filename)
+            if os.path.exists(local_downloads_path) and os.path.getsize(local_downloads_path) > 0:
                 # ファイル名からFC2 IDを抽出して、タスクの状態を確認
                 extracted_fc2_id = self._extract_fc2_id_from_filename(safe_filename)
                 if extracted_fc2_id == fc2_id:
                     task = self.task_status.get(fc2_id)
                     # タスクが存在し、かつダウンロード完了、アップロード待ち、アップロード中、スキップアップロードの状態であればスキップ
                     if task and task.get("status") in ["completed", "pending_upload", "uploading", "skipped_upload"]:
-                        logging.info(f"ローカルに既存ファイル '{local_path}' を検出。タスク {fc2_id} は既に処理済みまたは処理中のためスキップします。") # ログ維持
+                        logging.info(f"ローカルに既存ファイル '{local_downloads_path}' を検出。タスク {fc2_id} は既に処理済みまたは処理中のためスキップします。") # ログ維持
                         logging.debug(f"タスク {fc2_id} は状態 '{task.get('status')}' で既に存在するためスキップ。") # デバッグログ追加
                         self._status_updated_event.set() # 状態変更時にイベントをセット
                         return # 処理終了
                     elif task and task.get("status") in ["pending_download", "downloading", "paused", "error", "failed_download", "failed_upload"]:
                          # ファイルは存在するが、タスクの状態がダウンロード中やエラーなどの場合
-                         logging.warning(f"ローカルに既存ファイル '{local_path}' を検出しましたが、タスク {fc2_id} の状態が '{task.get('status')}' です。タスクをリセットしてダウンロードキューに戻します。") # ログ維持
+                         logging.warning(f"ローカルに既存ファイル '{local_downloads_path}' を検出しましたが、タスク {fc2_id} の状態が '{task.get('status')}' です。タスクをリセットしてダウンロードキューに戻します。") # ログ維持
                          # タスクをリセットしてダウンロードキューに戻す処理は check_and_resume_downloads で行うため、ここでは何もしない
                          pass # check_and_resume_downloads に任せる
                     else:
                          # タスクが task_status に存在しない場合
-                         logging.info(f"ローカルに既存ファイル '{local_path}' を検出。タスク {fc2_id} が task_status に存在しないため、ダウンロード完了としてマークし、アップロードキューに追加します。") # ログ維持
+                         logging.info(f"ローカルに既存ファイル '{local_downloads_path}' を検出。タスク {fc2_id} が task_status に存在しないため、ダウンロード完了としてマークし、アップロードキューに追加します。") # ログ維持
                          # タスクを新しく作成し、ダウンロード完了としてマーク
                          self.task_status[fc2_id] = {
                              "status": "completed", # ダウンロード完了としてマーク
@@ -147,7 +220,7 @@ class StatusManager:
                              "rating": video_info.get('rating'),
                              "download_progress": 100.0,
                              "upload_progress": 0,
-                             "local_path": local_path, # 既存のローカルパスを設定
+                             "local_path": local_downloads_path, # 既存のローカルパスを設定
                              "error_message": None,
                              "last_updated": datetime.now().isoformat()
                          }
@@ -169,10 +242,11 @@ class StatusManager:
                          return # 処理終了
 
                 else:
-                    logging.warning(f"ローカルに既存ファイル '{local_path}' を検出しましたが、ファイル名からFC2 ID '{fc2_id}' を抽出できませんでした。スキップせず、ダウンロードタスクとして追加/更新します。") # ログ維持
+                    logging.warning(f"ローカルに既存ファイル '{local_downloads_path}' を検出しましたが、ファイル名からFC2 ID '{fc2_id}' を抽出できませんでした。スキップせず、ダウンロードタスクとして追加/更新します。") # ログ維持
                     # FC2 IDが一致しない場合は、既存ファイルと見なさず、ダウンロードタスクとして続行
 
-            # ローカルファイルが存在しない、またはサイズが0、または既存ファイルと見なされなかった場合、ダウンロードタスクとして追加/更新
+
+            # ローカルファイルもアップロード先ファイルも存在しない、またはサイズが0
             # タスクが task_status に存在しない、または状態が pending_download/downloading でない場合
             if fc2_id not in self.task_status or (self.task_status[fc2_id].get("status") not in ["pending_download", "downloading"]):
                 logging.info(f"タスク {fc2_id} をダウンロードキューに追加/更新します。") # ログ維持
@@ -585,6 +659,7 @@ class StatusManager:
         """
         ダウンロードディレクトリをスキャンし、既存のダウンロード済みファイルや
         中断された可能性のある部分ファイルをチェックして、必要に応じてタスクをレジュームまたはリセットする。
+        また、アップロード完了済みのタスクに対応する部分ファイルを削除する。
         """
         async with self._lock:
             logging.info(f"ダウンロードディレクトリ '{download_dir}' のスキャンを開始します。") # ログ維持
@@ -679,8 +754,18 @@ class StatusManager:
                         task = self.task_status.get(fc2_id)
                         logging.debug(f"タスク {fc2_id} の現在の状態: {task.get('status') if task else 'None'}") # デバッグログ追加
 
-                        # task_status に存在し、かつ downloading または paused 状態の場合にレジューム可能と判断
-                        if task and task.get("status") in ["downloading", "paused"]:
+                        # タスクが存在し、かつアップロード完了済みの状態であれば部分ファイルを削除
+                        if task and task.get("status") in ["completed", "skipped_upload"]:
+                             logging.info(f"アップロード完了済みのタスク {fc2_id} に対応する部分ファイル '{filename}' を検出。ファイルを削除します。") # ログ維持
+                             try:
+                                 os.remove(file_path)
+                                 logging.info(f"部分ファイル '{file_path}' を削除しました。") # ログ維持
+                                 logging.debug(f"部分ファイル '{file_path}' の削除に成功しました。") # デバッグログ追加
+                             except OSError as e:
+                                 logging.error(f"部分ファイル '{file_path}' の削除に失敗しました: {e}") # ログ維持
+                                 logging.debug(f"部分ファイル '{file_path}' の削除に失敗しました: {e}") # デバッグログ追加
+                        # task_status に存在し、かつ pending_download, downloading, paused, error, failed_download 状態の場合にレジューム可能と判断
+                        elif task and task.get("status") in ["pending_download", "downloading", "paused", "error", "failed_download"]:
                             logging.info(f"中断されたダウンロードファイル '{filename}' に対応するタスク {fc2_id} を検出。ダウンロードをレジュームします。") # ログ維持
                             # 状態を pending_download に戻し、ダウンロードキューの先頭に追加
                             task["status"] = "pending_download"
@@ -695,15 +780,10 @@ class StatusManager:
                                 logging.debug(f"タスク {fc2_id} は既にダウンロードキューに存在します。状態のみ更新。") # デバッグログ維持
 
                         else:
-                            # レジューム不可能な状態、または task_status に存在しない場合はファイルを削除
-                            logging.warning(f"部分ファイル '{filename}' に対応するタスク {fc2_id} はレジューム不可能な状態 '{task.get('status') if task else 'None'}' です、またはタスクが見つかりません。ファイルを削除します。") # ログ維持
-                            try:
-                                os.remove(file_path)
-                                logging.info(f"部分ファイル '{file_path}' を削除しました。") # ログ維持
-                                logging.debug(f"部分ファイル '{file_path}' の削除に成功しました。") # デバッグログ追加
-                            except OSError as e:
-                                logging.error(f"部分ファイル '{file_path}' の削除に失敗しました: {e}") # ログ維持
-                                logging.debug(f"部分ファイル '{file_path}' の削除に失敗しました: {e}") # デバッグログ追加
+                            # タスクが task_status に存在しない、またはレジューム・完了以外の状態の場合
+                            logging.warning(f"部分ファイル '{filename}' に対応するタスク {fc2_id} はレジューム対象外の状態 '{task.get('status') if task else 'None'}' です、またはタスクが task_status に見つかりません。ファイルを削除せずスキップします。") # ログ維持
+                            # ファイルを削除せずスキップ
+                            pass
 
                     else:
                         # FC2 ID が抽出できない .part ファイルは孤立している可能性が高いので削除

@@ -149,103 +149,99 @@ def _check_duplicate_smb(target_dir_pysmb: str, local_filename: str) -> Optional
             logging.info("SMB接続をクローズしました (重複チェック)。")
 
 
-def _upload_file_smb(local_path: str, remote_path_pysmb: str, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
-    """ファイルをSMBサーバーにアップロードする (同期)"""
-    conn = None
-    try:
-        conn = _get_smb_connection()
-        assert conn.connect(FILEHUB_ADDRESS, 139)
-        logging.info(f"SMB接続成功 (アップロード): {FILEHUB_ADDRESS}")
+# _upload_file_smb 関数を非同期化し、リトライロジックを追加
+async def _upload_file_smb(local_path: str, remote_path_pysmb: str, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+    """ファイルをSMBサーバーにアップロードする (非同期、リトライ付き)"""
+    max_retries = 3 # 最大リトライ回数
+    retry_delay = 5 # リトライ間隔 (秒)
 
-        # リモートパス (共有名からの相対パス)
-        # 例: /Adult/FC2-PPV-123/local_filename.mp4
-        full_remote_path = remote_path_pysmb
+    for attempt in range(max_retries + 1):
+        conn = None
+        try:
+            conn = _get_smb_connection()
+            # 接続は非同期で実行
+            await asyncio.to_thread(conn.connect, FILEHUB_ADDRESS, 139)
+            logging.info(f"SMB接続成功 (アップロード, 試行 {attempt + 1}/{max_retries + 1}): {FILEHUB_ADDRESS}")
 
-        logging.info(f"SMBアップロード開始: {local_path} -> {FILEHUB_SHARE}{full_remote_path}")
+            full_remote_path = remote_path_pysmb
+            logging.info(f"SMBアップロード開始: {local_path} -> {FILEHUB_SHARE}{full_remote_path}")
 
-        local_file_size = os.path.getsize(local_path)
-        uploaded_size = 0
-        chunk_size = 8192 # 8KB チャンク
-        last_report_time = time.time()
-        report_interval = 0.1 # 0.1秒ごとに進捗報告 (0.5から変更)
+            local_file_size = os.path.getsize(local_path)
+            uploaded_size = 0
+            chunk_size = 8192 # 8KB チャンク
+            last_report_time = time.time()
+            report_interval = 0.1 # 0.1秒ごとに進捗報告
 
-        if progress_callback:
-            progress_callback({"status": "uploading", "percentage": 0, "message": "アップロード開始", "uploaded_bytes": 0, "total_bytes": local_file_size})
-
-        with open(local_path, 'rb') as local_file:
-            # storeFile はファイルオブジェクトを受け付けるが、進捗を得るためにはチャンクで読み込む
-            # pysmb の storeFile はファイルオブジェクト全体を渡すため、進捗コールバックを内部でサポートしていない
-            # リアルタイム性を出すには、ファイルをチャンクに分けて読み込み、SMBConnection.storeFileFromOffset を使う必要がある
-            # storeFileFromOffset は BytesIO のような seek/read を持つオブジェクトを期待する
-            # 例: conn.storeFileFromOffset(service_name, path, file_obj, offset, max_length)
-
-            # storeFileFromOffset を使うように修正
-            offset = 0
-            while offset < local_file_size:
-                # チャンクを読み込む
-                local_file.seek(offset)
-                chunk = local_file.read(chunk_size)
-                if not chunk:
-                    break # ファイルの終端に達した
-
-                # SMBに書き込む
-                # storeFileFromOffset は BytesIO のような seek/read を持つオブジェクトを期待する
-                chunk_io = BytesIO(chunk)
-                conn.storeFileFromOffset(FILEHUB_SHARE, full_remote_path, chunk_io, offset, len(chunk))
-
-                uploaded_size += len(chunk)
-                offset += len(chunk)
-
-                current_time = time.time()
-                # 定期的に進捗報告
-                if progress_callback and (current_time - last_report_time > report_interval):
-                    percentage = (uploaded_size / local_file_size * 100) if local_file_size > 0 else 0
-                    progress_callback({
-                        "status": "uploading",
-                        "percentage": round(percentage, 2),
-                        "uploaded_bytes": uploaded_size,
-                        "total_bytes": local_file_size,
-                        "message": f"アップロード中 ({percentage:.2f}%)"
-                    })
-                    last_report_time = current_time
-
-            # ループ終了後、最後の進捗報告 (100%)
             if progress_callback:
-                 progress_callback({
-                     "status": "uploading", # 完了直前も uploading ステータスで100%を報告
-                     "percentage": 100.0,
-                     "uploaded_bytes": local_file_size,
-                     "total_bytes": local_file_size,
-                     "message": "アップロード完了間近"
-                 })
+                progress_callback({"status": "uploading", "percentage": 0, "message": "アップロード開始", "uploaded_bytes": 0, "total_bytes": local_file_size})
+
+            with open(local_path, 'rb') as local_file:
+                offset = 0
+                while offset < local_file_size:
+                    local_file.seek(offset)
+                    chunk = local_file.read(chunk_size)
+                    if not chunk:
+                        break # ファイルの終端に達した
+
+                    chunk_io = BytesIO(chunk)
+                    # storeFileFromOffset も非同期で実行
+                    await asyncio.to_thread(conn.storeFileFromOffset, FILEHUB_SHARE, full_remote_path, chunk_io, offset, len(chunk))
+
+                    uploaded_size += len(chunk)
+                    offset += len(chunk)
+
+                    current_time = time.time()
+                    # 定期的に進捗報告
+                    if progress_callback and (current_time - last_report_time > report_interval):
+                        percentage = (uploaded_size / local_file_size * 100) if local_file_size > 0 else 0
+                        progress_callback({
+                            "status": "uploading",
+                            "percentage": round(percentage, 2),
+                            "uploaded_bytes": uploaded_size,
+                            "total_bytes": local_file_size,
+                            "message": f"アップロード中 ({percentage:.2f}%)"
+                        })
+                        last_report_time = current_time
+
+                # ループ終了後、最後の進捗報告 (100%)
+                if progress_callback:
+                     progress_callback({
+                         "status": "uploading", # 完了直前も uploading ステータスで100%を報告
+                         "percentage": 100.0,
+                         "uploaded_bytes": local_file_size,
+                         "total_bytes": local_file_size,
+                         "message": "アップロード完了間近"
+                     })
 
 
-        logging.info(f"SMBアップロード完了: {FILEHUB_SHARE}{full_remote_path}")
-        if progress_callback:
-            progress_callback({"status": "finished", "percentage": 100, "message": "アップロード完了"})
+            logging.info(f"SMBアップロード完了: {FILEHUB_SHARE}{full_remote_path}")
+            if progress_callback:
+                progress_callback({"status": "finished", "percentage": 100, "message": "アップロード完了"})
+            return # 成功したらループを抜ける
 
-    except FileNotFoundError:
-        logging.error(f"ローカルファイルが見つかりません: {local_path}")
-        if progress_callback:
-            progress_callback({"status": "error", "message": "ローカルファイル不明"})
-        raise
-    except OperationFailure as e:
-        logging.error(f"SMBアップロードエラーが発生しました: {FILEHUB_SHARE}{full_remote_path} - {e}", exc_info=True)
-        if progress_callback:
-            progress_callback({"status": "error", "message": f"SMBエラー: {e}"})
-        raise
-    except ValueError as e:
-         logging.error(f"設定エラー: {e}")
-         raise
-    except Exception as e:
-        logging.error(f"SMBアップロード中に予期せぬエラーが発生しました: {FILEHUB_SHARE}{full_remote_path} - {e}", exc_info=True)
-        if progress_callback:
-            progress_callback({"status": "error", "message": f"予期せぬエラー: {e}"})
-        raise
-    finally:
-        if conn:
-            conn.close()
-            logging.info("SMB接続をクローズしました (アップロード)。")
+        except FileNotFoundError:
+            logging.error(f"ローカルファイルが見つかりません: {local_path}")
+            if progress_callback:
+                progress_callback({"status": "error", "message": "ローカルファイル不明"})
+            raise # ローカルファイルがない場合はリトライしても無意味なので再発生
+
+        except (OperationFailure, Exception) as e:
+            logging.warning(f"SMBアップロード中にエラーが発生しました (試行 {attempt + 1}/{max_retries + 1}): {FILEHUB_SHARE}{full_remote_path} - {e}")
+            if attempt < max_retries:
+                logging.info(f"{retry_delay}秒後にリトライします...")
+                if progress_callback:
+                     progress_callback({"status": "uploading", "message": f"リトライ中 ({attempt + 1}/{max_retries})"}) # リトライ中のメッセージ
+                await asyncio.sleep(retry_delay)
+            else:
+                logging.error(f"SMBアップロードが最大リトライ回数 ({max_retries}) を超えて失敗しました: {FILEHUB_SHARE}{full_remote_path} - {e}", exc_info=True)
+                if progress_callback:
+                    progress_callback({"status": "error", "message": f"アップロード失敗: {e}"})
+                raise # 最大リトライ後も失敗した場合は再発生
+
+        finally:
+            if conn:
+                conn.close()
+                logging.info(f"SMB接続をクローズしました (アップロード, 試行 {attempt + 1}/{max_retries + 1})。")
 
 
 # --- 統合アップロード関数 (非同期ラッパー) ---
@@ -324,9 +320,11 @@ async def upload_to_server(
                 # ローカルファイルの方が小さい場合、上書きしてアップロードを続行
                 logging.info(f"ローカルファイルの方が小さいため、上書きしてアップロードを続行します: {local_filename}")
                 # そのままアップロード処理に進む (_upload_file_smb はデフォルトで上書き)
+                pass # アップロード処理に進む
 
         # 6. ファイルアップロード (非同期実行) - 重複がない場合、またはローカルファイルが小さい場合
-        await asyncio.to_thread(_upload_file_smb, local_file_path, remote_file_path_pysmb, progress_callback)
+        # リトライ付きの非同期関数を呼び出す
+        await _upload_file_smb(local_file_path, remote_file_path_pysmb, progress_callback)
 
         return True # アップロード成功
 
